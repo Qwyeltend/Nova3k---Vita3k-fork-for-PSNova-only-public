@@ -38,11 +38,18 @@ A detailed technical change list (in Russian) is in [NOVA3K.md](NOVA3K.md).
 Same as Vita3K: install the PS Vita firmware, then install the game (a `.pkg` with its license, or a dumped game folder / `.vpk` / `.zip`). See the [Vita3K quickstart](https://vita3k.org/quickstart.html).
 Как в Vita3K: установить прошивку PS Vita, затем саму игру (`.pkg` с лицензией или папку / `.vpk` / `.zip` с дампом). См. [инструкцию Vita3K](https://vita3k.org/quickstart.html).
 
-Recommended per-game settings / Рекомендуемые настройки игры:
-- Renderer / Рендер: **Vulkan**
-- Memory mapping / Отображение памяти: **Double buffer** (default / по умолчанию)
-- **FPS Hack**: on for 60 FPS / включить для 60 FPS
-- **V-Sync**: on / включить
+The game needs these settings to work properly (per-game settings):
+Для правильной работы игре нужны такие настройки (настройки игры):
+
+| Setting / Настройка | Value / Значение |
+|---|---|
+| GPU / Рендер | **Vulkan** |
+| V-Sync | **ON / вкл** |
+| Disable surface sync | **OFF / выкл** |
+| Async Pipeline Compilation | **ON / вкл** |
+| Memory mapping / Отображение памяти | **Double buffer** |
+| FPS Hack | **ON / вкл** (for 60 FPS / для 60 FPS) |
+| Audio / Звук | **SDL** |
 
 ## Building / Сборка
 

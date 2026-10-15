@@ -6,5 +6,7 @@ First public build of Nova3K, a Vita3K fork for **Phantasy Star Nova** on Androi
 - No black screen before the SEGA logo / нет чёрного экрана перед логотипом SEGA.
 - Character editor texture fixes / исправлены текстуры в редакторе персонажа (rare glitches may remain / редкие глитчи ещё возможны).
 
+Required settings / нужные настройки: GPU **Vulkan**, V-Sync **ON**, Disable surface sync **OFF**, Async Pipeline Compilation **ON**, memory mapping **Double buffer**, FPS Hack **ON** (for 60 FPS), audio **SDL**.
+
 The game is not included. See the README for setup.
 Игра в комплект не входит. Настройка — в README.

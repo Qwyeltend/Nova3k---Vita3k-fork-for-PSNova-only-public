@@ -1,0 +1,107 @@
+# Nova3K: builds the Android APK (arm64).
+# Runs only when started by hand (Actions -> Nova3K Android -> Run workflow),
+# so changes can pile up on main without spending a build on each push.
+# With a version number the APK is published as a GitHub release (v<version>);
+# without one it is only attached to the workflow run (test build).
+name: Nova3K Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. 0.1.0 (leave empty for a test build without a release)'
+        required: false
+        default: ''
+
+concurrency:
+  group: nova3k-android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-binary-cache
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-bincache-android-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', 'cmake/**', '.ci/**', 'android/app/build.gradle') }}
+          restore-keys: |
+            vcpkg-bincache-android-
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          add-job-summary: on-failure
+          cache-provider: basic
+          validate-wrappers: false
+
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Set up Android build environment
+        env:
+          VCPKG_ROOT: /usr/local/share/vcpkg
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          bash ./.ci/setup-android.sh
+
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: nova3k-android
+
+      - name: Build APK
+        env:
+          # Release key from the repository secrets, so updates install over the old app.
+          SIGNING_STORE_PATH: ${{ runner.temp }}/nova3k-release.jks
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: nova3k
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_STORE_BASE64: ${{ secrets.SIGNING_STORE_BASE64 }}
+          VCPKG_ROOT: /usr/local/share/vcpkg
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          if [ -z "$SIGNING_STORE_BASE64" ]; then echo "Signing secrets are missing" >&2; exit 1; fi
+          echo "$SIGNING_STORE_BASE64" | base64 -d > "$SIGNING_STORE_PATH"
+          bash ./.ci/build-android.sh out
+          rm -f "$SIGNING_STORE_PATH"
+          name="Nova3K-${{ inputs.version }}"
+          [ -n "${{ inputs.version }}" ] || name="Nova3K-test-$(git rev-parse --short HEAD)"
+          mv out/app.apk "out/$name.apk"
+          ls -l out
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Nova3K-android
+          path: out/*.apk
+
+      - name: Publish release
+        if: ${{ inputs.version != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ inputs.version }}" out/*.apk \
+            --title "Nova3K ${{ inputs.version }}" \
+            --notes-file RELEASE_NOTES.md \
+            --target "${{ github.sha }}"

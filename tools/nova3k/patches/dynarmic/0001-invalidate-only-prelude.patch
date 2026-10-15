@@ -1,0 +1,16 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index bbdf925f..0e0df8c3 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -362,7 +362,10 @@ void A32AddressSpace::EmitPrelude() {
+ 
+     prelude_info.end_of_prelude = code.offset();
+ 
+-    mem.invalidate_all();
++    // Nova3K: only the prelude was written. Invalidating the whole 128 MiB code cache touched every
++    // (still unused) page of it and cost tens of milliseconds on every JIT creation, i.e. on every
++    // guest thread the game creates. Blocks emitted later are invalidated one by one in Emit().
++    mem.invalidate(mem.ptr(), prelude_info.end_of_prelude);
+     ProtectCodeMemory();
+ }
+ 

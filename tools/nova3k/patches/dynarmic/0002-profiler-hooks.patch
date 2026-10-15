@@ -1,0 +1,185 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index 0e0df8c3..6620a163 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -5,6 +5,12 @@
+ 
+ #include "dynarmic/backend/arm64/a32_address_space.h"
+ 
++#include <string>
++
++#include <fmt/format.h>
++
++#include "dynarmic/interface/nova3k_stats.h"
++
+ #include "dynarmic/backend/arm64/a32_jitstate.h"
+ #include "dynarmic/backend/arm64/abi.h"
+ #include "dynarmic/backend/arm64/devirtualize.h"
+@@ -362,6 +368,20 @@ void A32AddressSpace::EmitPrelude() {
+ 
+     prelude_info.end_of_prelude = code.offset();
+ 
++    // Nova3K: describe the prelude once, so the profiler can name samples that land in it
++    if (!Nova3K::prelude_layout.load()) {
++        const auto off = [this](const void* p) { return static_cast<long>(reinterpret_cast<const std::byte*>(p) - reinterpret_cast<const std::byte*>(mem.ptr())); };
++        static const std::string layout = fmt::format(
++            "read8 {:X} read32 {:X} wrapped_read8 {:X} excl_read8 {:X} excl_read64 {:X} write8 {:X} wrapped_write8 {:X} "
++            "excl_write8 {:X} excl_write64 {:X} call_svc {:X} run_code {:X} step_code {:X} return_to_dispatcher {:X} return_from_run_code {:X} end {:X}",
++            off(prelude_info.read_memory_8), off(prelude_info.read_memory_32), off(prelude_info.wrapped_read_memory_8),
++            off(prelude_info.exclusive_read_memory_8), off(prelude_info.exclusive_read_memory_64), off(prelude_info.write_memory_8),
++            off(prelude_info.wrapped_write_memory_8), off(prelude_info.exclusive_write_memory_8), off(prelude_info.exclusive_write_memory_64),
++            off(prelude_info.call_svc), off(reinterpret_cast<const void*>(prelude_info.run_code)), off(reinterpret_cast<const void*>(prelude_info.step_code)),
++            off(prelude_info.return_to_dispatcher), off(prelude_info.return_from_run_code), static_cast<long>(prelude_info.end_of_prelude));
++        Nova3K::prelude_layout.store(layout.c_str());
++    }
++
+     // Nova3K: only the prelude was written. Invalidating the whole 128 MiB code cache touched every
+     // (still unused) page of it and cost tens of milliseconds on every JIT creation, i.e. on every
+     // guest thread the game creates. Blocks emitted later are invalidated one by one in Emit().
+diff --git a/src/dynarmic/backend/arm64/a32_interface.cpp b/src/dynarmic/backend/arm64/a32_interface.cpp
+index 6b38c410..af664c75 100644
+--- a/src/dynarmic/backend/arm64/a32_interface.cpp
++++ b/src/dynarmic/backend/arm64/a32_interface.cpp
+@@ -14,6 +14,7 @@
+ #include "dynarmic/backend/arm64/a32_address_space.h"
+ #include "dynarmic/backend/arm64/a32_core.h"
+ #include "dynarmic/backend/arm64/a32_jitstate.h"
++#include "dynarmic/frontend/A32/a32_location_descriptor.h"
+ #include "dynarmic/common/atomic.h"
+ #include "dynarmic/interface/A32/a32.h"
+ 
+@@ -122,6 +123,16 @@ struct Jit::Impl final {
+         current_state.exclusive_state = false;
+     }
+ 
++    std::uint32_t GuestPcForHostPc(std::uintptr_t host_pc) {
++        const auto ptr = reinterpret_cast<CodePtr>(host_pc);
++        if (!current_address_space.ContainsHostPc(ptr))
++            return 0xE0000001;  // not in this JIT's code cache
++        const auto location = current_address_space.ReverseGetLocation(ptr);
++        if (!location)
++            return 0xF0000000 | static_cast<std::uint32_t>(current_address_space.OffsetInCache(ptr) & 0x0FFFFFFF);  // prelude
++        return A32::LocationDescriptor{*location}.PC();
++    }
++
+     void DumpDisassembly() const {
+         ASSERT_FALSE("Unimplemented");
+     }
+@@ -236,4 +247,8 @@ void Jit::DumpDisassembly() const {
+     impl->DumpDisassembly();
+ }
+ 
++std::uint32_t Jit::GuestPcForHostPc(std::uintptr_t host_pc) {
++    return impl->GuestPcForHostPc(host_pc);
++}
++
+ }  // namespace Dynarmic::A32
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 2c7ae777..e759a1b9 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: 0BSD
+  */
+ 
++#include <chrono>
+ #include <cstdio>
+ 
+ #include <mcl/bit_cast.hpp>
+@@ -17,6 +18,7 @@
+ #include "dynarmic/common/fp/fpcr.h"
+ #include "dynarmic/common/llvm_disassemble.h"
+ #include "dynarmic/interface/exclusive_monitor.h"
++#include "dynarmic/interface/nova3k_stats.h"
+ 
+ namespace Dynarmic::Backend::Arm64 {
+ 
+@@ -65,13 +67,17 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
+         return block_entry;
+     }
+ 
++    const auto nova3k_start = std::chrono::steady_clock::now();
+     IR::Block ir_block = GenerateIR(descriptor);
+     const EmittedBlockInfo block_info = Emit(std::move(ir_block));
++    Nova3K::blocks_emitted.fetch_add(1, std::memory_order_relaxed);
++    Nova3K::emit_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - nova3k_start).count(), std::memory_order_relaxed);
+     return block_info.entry_point;
+ }
+ 
+ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors) {
+     UnprotectCodeMemory();
++    Nova3K::blocks_invalidated.fetch_add(descriptors.size(), std::memory_order_relaxed);
+ 
+     for (const auto& descriptor : descriptors) {
+         const auto iter = block_entries.find(descriptor);
+@@ -90,6 +96,7 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
+ }
+ 
+ void AddressSpace::ClearCache() {
++    Nova3K::cache_clears.fetch_add(1, std::memory_order_relaxed);
+     block_entries.clear();
+     reverse_block_entries.clear();
+     block_infos.clear();
+@@ -338,6 +345,7 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
+         if (patch_entry->second.recompile) {
+             const auto marker = patch_entry->second.marker;
+             fastmem_manager.MarkDoNotFastmem(marker);
++            Nova3K::fastmem_recompiles.fetch_add(1, std::memory_order_relaxed);
+             InvalidateBasicBlocks({std::get<0>(marker)});
+         }
+ 
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 835566bd..b860fe83 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -37,6 +37,15 @@ public:
+     // Returns "most likely" entry_point associated with the emitted code at that location
+     CodePtr ReverseGetEntryPoint(CodePtr host_pc);
+ 
++    // Nova3K: true if host_pc is inside this address space's code cache
++    bool ContainsHostPc(CodePtr host_pc) const {
++        const auto begin = reinterpret_cast<CodePtr>(mem.ptr());
++        return host_pc >= begin && host_pc < begin + code_cache_size;
++    }
++    std::ptrdiff_t OffsetInCache(CodePtr host_pc) const {
++        return host_pc - reinterpret_cast<CodePtr>(mem.ptr());
++    }
++
+     CodePtr GetOrEmit(IR::LocationDescriptor descriptor);
+ 
+     void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors);
+diff --git a/src/dynarmic/interface/A32/a32.h b/src/dynarmic/interface/A32/a32.h
+index e1c5b40f..0fe85d3b 100644
+--- a/src/dynarmic/interface/A32/a32.h
++++ b/src/dynarmic/interface/A32/a32.h
+@@ -92,6 +92,10 @@ public:
+     /// Debugging: Dump a disassembly all compiled code to the console.
+     void DumpDisassembly() const;
+ 
++    /// Nova3K profiler: guest PC of the translated block containing host_pc; 0xE0000001 if host_pc is
++    /// not in this JIT's code cache; 0xF0000000 | offset if it is in the prelude (dispatcher, trampolines). Only call from the thread running this JIT (e.g. a signal handler).
++    std::uint32_t GuestPcForHostPc(std::uintptr_t host_pc);
++
+     /**
+      * Disassemble the instructions following the current pc and return
+      * the resulting instructions as a vector of their string representations.
+diff --git a/src/dynarmic/interface/nova3k_stats.h b/src/dynarmic/interface/nova3k_stats.h
+new file mode 100644
+index 00000000..5480436b
+--- /dev/null
++++ b/src/dynarmic/interface/nova3k_stats.h
+@@ -0,0 +1,14 @@
++// Nova3K: JIT statistics for the emulator's performance monitor (read and reset once per second).
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++namespace Dynarmic::Nova3K {
++inline std::atomic<std::uint64_t> blocks_emitted{0};      // guest basic blocks translated
++inline std::atomic<std::uint64_t> emit_ns{0};             // time spent translating them
++inline std::atomic<std::uint64_t> blocks_invalidated{0};  // translated blocks thrown away
++inline std::atomic<std::uint64_t> fastmem_recompiles{0};  // blocks re-translated with slow memory access after a fault
++inline std::atomic<std::uint64_t> cache_clears{0};        // whole code caches cleared
++inline std::atomic<const char*> prelude_layout{nullptr};   // offsets of the prelude routines (first JIT only)
++}  // namespace Dynarmic::Nova3K

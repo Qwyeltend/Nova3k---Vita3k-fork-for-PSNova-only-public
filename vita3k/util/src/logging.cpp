@@ -16,6 +16,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <util/log.h>
+#include <util/nova3k_game.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -33,6 +34,19 @@
 #endif
 
 #include <functional>
+#if defined(__linux__)
+#include <atomic>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <unwind.h>
+#endif
 #include <iostream>
 #include <mutex>
 #include <vector>
@@ -49,6 +63,9 @@ static std::function<void(std::string, int)> s_log_callback;
 static std::mutex s_log_callback_mutex;
 
 static void register_log_exception_handler();
+#if defined(__linux__) && !defined(_WIN32)
+static void set_crash_file(const fs::path &path);
+#endif
 static void rebuild_default_logger();
 
 static void flush() {
@@ -96,6 +113,15 @@ ExitCode init(const Root &root_paths, bool use_stdout) {
     sinks.push_back(std::make_shared<callback_sink_mt>());
 #endif
 
+    // Nova3K: keep the previous session's log. After a crash Android restarts the app,
+    // and the new session would otherwise overwrite the log that shows the crash.
+    {
+        const fs::path log_file = root_paths.get_log_path() / LOG_FILE_NAME;
+        boost::system::error_code ec;
+        if (fs::exists(log_file, ec))
+            fs::rename(log_file, root_paths.get_log_path() / "vita3k.prev.log", ec);
+    }
+
     if (add_sink(root_paths.get_log_path() / LOG_FILE_NAME) != Success)
         return InitConfigFailed;
 
@@ -115,6 +141,9 @@ ExitCode init(const Root &root_paths, bool use_stdout) {
     spdlog::flush_on(spdlog::level::trace);
 #endif
 
+#if defined(__linux__) && !defined(_WIN32)
+    set_crash_file(root_paths.get_log_path() / "nova3k_crash.txt");
+#endif
     register_log_exception_handler();
 
     static std::terminate_handler old_terminate = nullptr;
@@ -234,7 +263,110 @@ void register_log_exception_handler() {
     }
 }
 
+#elif defined(__linux__)
+// Nova3K: native crash reporter for Linux/Android. Writes the signal, the crashing address and a
+// backtrace (with library offsets, symbolizable with libVita3K-symbols.zip) to nova3k_crash.txt
+// next to the log, flushes the log, then lets the previous handler / default action run.
+static char crash_file_path[1024] = {};
+static struct sigaction previous_actions[NSIG];
+
+static _Unwind_Reason_Code crash_unwind(struct _Unwind_Context *ctx, void *arg) {
+    auto *state = static_cast<std::pair<int, int> *>(arg); // fd, frame count
+    const uintptr_t pc = _Unwind_GetIP(ctx);
+    if (!pc || state->second >= 48)
+        return _URC_END_OF_STACK;
+    Dl_info info{};
+    char line[512];
+    if (dladdr(reinterpret_cast<void *>(pc), &info) && info.dli_fname) {
+        const char *module = std::strrchr(info.dli_fname, '/');
+        module = module ? module + 1 : info.dli_fname;
+        std::snprintf(line, sizeof(line), "#%02d %s+0x%zx %s\n", state->second, module,
+            static_cast<size_t>(pc - reinterpret_cast<uintptr_t>(info.dli_fbase)), info.dli_sname ? info.dli_sname : "");
+    } else {
+        std::snprintf(line, sizeof(line), "#%02d 0x%zx\n", state->second, static_cast<size_t>(pc));
+    }
+    (void)!write(state->first, line, std::strlen(line));
+    state->second++;
+    return _URC_NO_REASON;
+}
+
+static std::atomic<int> crash_reports_written{ 0 };
+
+// Nova3K: writes one crash report to nova3k_crash.txt. The first report of a run replaces the old file,
+// later ones (another thread crashing at the same time, or the abort that follows) are appended.
+void write_crash_report(int sig, void *info_ptr, void *uctx) {
+    siginfo_t *info = static_cast<siginfo_t *>(info_ptr);
+    const bool first = crash_reports_written.fetch_add(1) == 0;
+    const int fd = open(crash_file_path, O_WRONLY | O_CREAT | (first ? O_TRUNC : O_APPEND), 0644);
+    if (fd >= 0) {
+        if (!first)
+            (void)!write(fd, "\n", 1);
+        char line[512];
+        uintptr_t pc = 0;
+#if defined(__aarch64__)
+        pc = static_cast<uintptr_t>(static_cast<ucontext_t *>(uctx)->uc_mcontext.pc);
+#endif
+        Dl_info dl{};
+        size_t pc_off = 0;
+        const char *pc_mod = "?";
+        if (pc && dladdr(reinterpret_cast<void *>(pc), &dl) && dl.dli_fname) {
+            pc_off = pc - reinterpret_cast<uintptr_t>(dl.dli_fbase);
+            pc_mod = std::strrchr(dl.dli_fname, '/') ? std::strrchr(dl.dli_fname, '/') + 1 : dl.dli_fname;
+        }
+        std::snprintf(line, sizeof(line), "Nova3K crash: signal %d (code %d), fault address %p, pc %s+0x%zx, thread %ld\nbacktrace:\n",
+            sig, info ? info->si_code : 0, info ? info->si_addr : nullptr, pc_mod, pc_off, static_cast<long>(syscall(SYS_gettid)));
+        (void)!write(fd, line, std::strlen(line));
+        std::pair<int, int> state{ fd, 0 };
+        _Unwind_Backtrace(crash_unwind, &state);
+        const auto &rt = nova3k::game::render_trace();
+        if (rt.commands) {
+            std::snprintf(line, sizeof(line), "render thread: command #%llu, opcode %u, flags 0x%x, command %p, context %p, stage %s\n",
+                static_cast<unsigned long long>(rt.commands), rt.opcode, rt.flags, reinterpret_cast<void *>(rt.command),
+                reinterpret_cast<void *>(rt.context), rt.stage == 1 ? "run" : rt.stage == 2 ? "free" : "-");
+            (void)!write(fd, line, std::strlen(line));
+        }
+        close(fd);
+    }
+}
+
+static void crash_handler(int sig, siginfo_t *info, void *uctx) {
+    write_crash_report(sig, info, uctx);
+    LOG_CRITICAL("Nova3K: fatal signal {} - details in nova3k_crash.txt", sig);
+    flush();
+    usleep(300000);
+    // chain to whoever was there before (Android's debuggerd writes a tombstone), else default action
+    const struct sigaction &prev = previous_actions[sig];
+    if (prev.sa_flags & SA_SIGINFO) {
+        if (prev.sa_sigaction) {
+            prev.sa_sigaction(sig, info, uctx);
+            return;
+        }
+    } else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN) {
+        prev.sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void set_crash_file(const fs::path &path) {
+    std::snprintf(crash_file_path, sizeof(crash_file_path), "%s", path.string().c_str());
+}
+
+void register_log_exception_handler() {
+    // while a game runs, the emulator's memory-protection handler replaces this one for SIGSEGV
+    for (const int sig : { SIGABRT, SIGBUS, SIGILL, SIGFPE, SIGSEGV }) {
+        struct sigaction action {};
+        action.sa_sigaction = crash_handler;
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&action.sa_mask);
+        sigaction(sig, &action, &previous_actions[sig]);
+    }
+}
 #else
 void register_log_exception_handler() {}
+#endif
+#if !defined(__linux__) || defined(_WIN32)
+void write_crash_report(int, void *, void *) {}
 #endif
 } // namespace logging

@@ -28,6 +28,7 @@
 
 #include <util/fs.h>
 #include <util/log.h>
+#include <util/nova3k_game.h>
 
 #include <SDL3/SDL_cpuinfo.h>
 
@@ -867,7 +868,12 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
         color_blending.flags = vk::PipelineColorBlendStateCreateFlagBits::eRasterizationOrderAttachmentAccessEXT;
 
     const bool frag_has_no_output = static_cast<bool>(gxm_fragment_shader->program_flags & SCE_GXM_PROGRAM_FLAG_OUTPUT_UNDEFINED);
-    if (is_fragment_disabled || frag_has_no_output || use_shader_interlock) {
+    // Nova3K (PSO2): the Vulkan renderer does not emulate the Vita mask bit; a mask update program
+    // (sceGxmShaderPatcherCreateMaskUpdateFragmentProgram) outputs the mask value as a color instead.
+    // PSO2 6.31 writes the mask (value 1) right after building the 3D picture each frame, so the 3D
+    // layer was painted white under the UI. A mask update must never touch the color buffer.
+    const bool nova3k_mask_no_color = fragment_program_gxm.is_maskupdate && nova3k::game::pso2_active().load(std::memory_order_relaxed);
+    if (is_fragment_disabled || frag_has_no_output || use_shader_interlock || nova3k_mask_no_color) {
         // The write mask must be empty as the lack of a fragment shader results in undefined values
         static const vk::PipelineColorBlendAttachmentState blending = {
             .blendEnable = VK_FALSE,

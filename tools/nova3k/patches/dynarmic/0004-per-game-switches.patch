@@ -1,0 +1,173 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index 6620a163..b6efc450 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -385,7 +385,11 @@ void A32AddressSpace::EmitPrelude() {
+     // Nova3K: only the prelude was written. Invalidating the whole 128 MiB code cache touched every
+     // (still unused) page of it and cost tens of milliseconds on every JIT creation, i.e. on every
+     // guest thread the game creates. Blocks emitted later are invalidated one by one in Emit().
+-    mem.invalidate(mem.ptr(), prelude_info.end_of_prelude);
++    if (Nova3K::invalidate_only_prelude.load(std::memory_order_relaxed)) {
++        mem.invalidate(mem.ptr(), prelude_info.end_of_prelude);
++    } else {
++        mem.invalidate_all();
++    }
+     ProtectCodeMemory();
+ }
+ 
+diff --git a/src/dynarmic/backend/arm64/exclusive_monitor.cpp b/src/dynarmic/backend/arm64/exclusive_monitor.cpp
+index bbd75a9d..3a0ca45d 100644
+--- a/src/dynarmic/backend/arm64/exclusive_monitor.cpp
++++ b/src/dynarmic/backend/arm64/exclusive_monitor.cpp
+@@ -26,24 +26,43 @@ void ExclusiveMonitor::Unlock() {
+     lock.Unlock();
+ }
+ 
+-// Nova3K: lock-free monitor. A processor's reservation is checked and consumed only by itself;
+-// other processors' reservations are not cleared here - their own compare-and-swap fails if the
+-// value changed. This removes the global spinlock and the scan over all 150 processor slots that
+-// every STREX of every guest thread used to take.
+ bool ExclusiveMonitor::CheckAndClear(size_t processor_id, VAddr address) {
+     const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
+-    const VAddr reserved = __atomic_exchange_n(&exclusive_addresses[processor_id], INVALID_EXCLUSIVE_ADDRESS, __ATOMIC_ACQUIRE);
+-    return reserved == masked_address;
++
++    Lock();
++    if (exclusive_addresses[processor_id] != masked_address) {
++        Unlock();
++        return false;
++    }
++
++    for (VAddr& other_address : exclusive_addresses) {
++        if (other_address == masked_address) {
++            other_address = INVALID_EXCLUSIVE_ADDRESS;
++        }
++    }
++    return true;
+ }
+ 
+ void ExclusiveMonitor::Clear() {
+-    for (VAddr& address : exclusive_addresses) {
+-        __atomic_store_n(&address, INVALID_EXCLUSIVE_ADDRESS, __ATOMIC_RELAXED);
++    if (Nova3K::lock_free_exclusive_monitor.load(std::memory_order_relaxed)) {
++        for (VAddr& address : exclusive_addresses) {
++            __atomic_store_n(&address, INVALID_EXCLUSIVE_ADDRESS, __ATOMIC_RELAXED);
++        }
++        return;
+     }
++    Lock();
++    std::fill(exclusive_addresses.begin(), exclusive_addresses.end(), INVALID_EXCLUSIVE_ADDRESS);
++    Unlock();
+ }
+ 
+ void ExclusiveMonitor::ClearProcessor(size_t processor_id) {
+-    __atomic_store_n(&exclusive_addresses[processor_id], INVALID_EXCLUSIVE_ADDRESS, __ATOMIC_RELAXED);
++    if (Nova3K::lock_free_exclusive_monitor.load(std::memory_order_relaxed)) {
++        __atomic_store_n(&exclusive_addresses[processor_id], INVALID_EXCLUSIVE_ADDRESS, __ATOMIC_RELAXED);
++        return;
++    }
++    Lock();
++    exclusive_addresses[processor_id] = INVALID_EXCLUSIVE_ADDRESS;
++    Unlock();
+ }
+ 
+ }  // namespace Dynarmic
+diff --git a/src/dynarmic/interface/exclusive_monitor.h b/src/dynarmic/interface/exclusive_monitor.h
+index a799f815..7afb3c25 100644
+--- a/src/dynarmic/interface/exclusive_monitor.h
++++ b/src/dynarmic/interface/exclusive_monitor.h
+@@ -12,6 +12,8 @@
+ #include <cstring>
+ #include <vector>
+ 
++#include <dynarmic/interface/nova3k_stats.h>
++
+ #include <dynarmic/common/spin_lock.h>
+ 
+ namespace Dynarmic {
+@@ -35,13 +37,22 @@ public:
+         static_assert(std::is_trivially_copyable_v<T>);
+         const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
+ 
+-        // Nova3K: lock-free. Each processor only touches its own slot; the exclusive store is a
+-        // compare-and-swap against the value read here, which is what really guarantees atomicity.
+-        // The old global spinlock serialized every LDREX/STREX of every guest thread.
+-        __atomic_store_n(&exclusive_addresses[processor_id], INVALID_EXCLUSIVE_ADDRESS, __ATOMIC_RELAXED);
++        if (Nova3K::lock_free_exclusive_monitor.load(std::memory_order_relaxed)) {
++            // Nova3K: lock-free. Each processor only touches its own slot; the exclusive store is a
++            // compare-and-swap against the value read here, which is what really guarantees atomicity.
++            // The old global spinlock serialized every LDREX/STREX of every guest thread.
++            __atomic_store_n(&exclusive_addresses[processor_id], INVALID_EXCLUSIVE_ADDRESS, __ATOMIC_RELAXED);
++            const T value = op();
++            std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
++            __atomic_store_n(&exclusive_addresses[processor_id], masked_address, __ATOMIC_RELEASE);
++            return value;
++        }
++
++        Lock();
++        exclusive_addresses[processor_id] = masked_address;
+         const T value = op();
+         std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
+-        __atomic_store_n(&exclusive_addresses[processor_id], masked_address, __ATOMIC_RELEASE);
++        Unlock();
+         return value;
+     }
+ 
+@@ -52,13 +63,25 @@ public:
+     template<typename T, typename Function>
+     bool DoExclusiveOperation(size_t processor_id, VAddr address, Function op) {
+         static_assert(std::is_trivially_copyable_v<T>);
++        if (Nova3K::lock_free_exclusive_monitor.load(std::memory_order_relaxed)) {
++            if (!CheckAndClearLockFree(processor_id, address)) {
++                return false;
++            }
++            T saved_value;
++            std::memcpy(&saved_value, exclusive_values[processor_id].data(), sizeof(T));
++            return op(saved_value);  // Nova3K: op is an atomic compare-and-swap; no global lock
++        }
++
+         if (!CheckAndClear(processor_id, address)) {
+             return false;
+         }
+ 
+         T saved_value;
+         std::memcpy(&saved_value, exclusive_values[processor_id].data(), sizeof(T));
+-        return op(saved_value);  // Nova3K: op is an atomic compare-and-swap; no global lock
++        const bool result = op(saved_value);
++
++        Unlock();
++        return result;
+     }
+ 
+     /// Unmark everything.
+@@ -68,6 +91,15 @@ public:
+ 
+ private:
+     bool CheckAndClear(size_t processor_id, VAddr address);
++    // Nova3K: lock-free check. A processor's reservation is checked and consumed only by itself;
++    // other processors' reservations are not cleared here - their own compare-and-swap fails if the
++    // value changed. This removes the global spinlock and the scan over all processor slots that
++    // every STREX of every guest thread used to take.
++    bool CheckAndClearLockFree(size_t processor_id, VAddr address) {
++        const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
++        const VAddr reserved = __atomic_exchange_n(&exclusive_addresses[processor_id], INVALID_EXCLUSIVE_ADDRESS, __ATOMIC_ACQUIRE);
++        return reserved == masked_address;
++    }
+ 
+     void Lock();
+     void Unlock();
+diff --git a/src/dynarmic/interface/nova3k_stats.h b/src/dynarmic/interface/nova3k_stats.h
+index 5480436b..aace65cf 100644
+--- a/src/dynarmic/interface/nova3k_stats.h
++++ b/src/dynarmic/interface/nova3k_stats.h
+@@ -12,3 +12,10 @@ inline std::atomic<std::uint64_t> fastmem_recompiles{0};  // blocks re-translate
+ inline std::atomic<std::uint64_t> cache_clears{0};        // whole code caches cleared
+ inline std::atomic<const char*> prelude_layout{nullptr};   // offsets of the prelude routines (first JIT only)
+ }  // namespace Dynarmic::Nova3K
++
++// Nova3K: per-game switches, set by the emulator when a game boots (before any guest thread runs).
++// false = original dynarmic behaviour.
++namespace Dynarmic::Nova3K {
++inline std::atomic<bool> lock_free_exclusive_monitor{false};  // LDREX/STREX without the global spinlock
++inline std::atomic<bool> invalidate_only_prelude{false};      // flush only the prelude, not the whole code cache, on JIT creation
++}  // namespace Dynarmic::Nova3K

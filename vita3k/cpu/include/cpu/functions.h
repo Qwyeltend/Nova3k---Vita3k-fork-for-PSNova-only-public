@@ -27,6 +27,8 @@
 struct MemState;
 
 CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem);
+// Nova3K: per-game JIT switches, set when a game boots (before its first thread). false = original dynarmic.
+void nova3k_set_jit_tweaks(bool lock_free_monitor, bool fast_jit_init);
 int run(CPUState &state);
 int step(CPUState &state);
 void stop(CPUState &state);

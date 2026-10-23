@@ -18,6 +18,7 @@
 #include <config/settings.h>
 
 #include <config/functions.h>
+#include <config/nova3k_profiles.h>
 
 #include <util/log.h>
 #include <util/vector_utils.h>
@@ -32,6 +33,10 @@ namespace {
 
 void copy_global_to_current(Config::CurrentConfig &current, const Config &cfg) {
     current.cpu_opt = cfg.cpu_opt;
+    current.nova3k_lock_free_monitor = cfg.nova3k_lock_free_monitor;
+    current.nova3k_fast_jit_init = cfg.nova3k_fast_jit_init;
+    current.nova3k_perf_monitor = cfg.nova3k_perf_monitor;
+    current.nova3k_pso2_patches = cfg.nova3k_pso2_patches;
     current.modules_mode = cfg.modules_mode;
     current.lle_modules = cfg.lle_modules;
     current.backend_renderer = cfg.backend_renderer;
@@ -77,6 +82,10 @@ void copy_global_to_current(Config::CurrentConfig &current, const Config &cfg) {
 
 void copy_current_to_global(Config &cfg, const Config::CurrentConfig &current) {
     cfg.cpu_opt = current.cpu_opt;
+    cfg.nova3k_lock_free_monitor = current.nova3k_lock_free_monitor;
+    cfg.nova3k_fast_jit_init = current.nova3k_fast_jit_init;
+    cfg.nova3k_perf_monitor = current.nova3k_perf_monitor;
+    cfg.nova3k_pso2_patches = current.nova3k_pso2_patches;
     cfg.modules_mode = current.modules_mode;
     cfg.lle_modules = current.lle_modules;
     cfg.backend_renderer = current.backend_renderer;
@@ -179,6 +188,14 @@ bool load_custom_config(Config::CurrentConfig &out, const fs::path &config_path,
     if (!config_child.child("cpu").empty())
         out.cpu_opt = config_child.child("cpu").attribute("cpu-opt").as_bool();
 
+    if (!config_child.child("nova3k").empty()) {
+        const auto nova3k = config_child.child("nova3k");
+        out.nova3k_lock_free_monitor = nova3k.attribute("lock-free-monitor").as_int(0);
+        out.nova3k_fast_jit_init = nova3k.attribute("fast-jit-init").as_int(0);
+        out.nova3k_perf_monitor = nova3k.attribute("perf-monitor").as_int(0);
+        out.nova3k_pso2_patches = nova3k.attribute("pso2-patches").as_int(0);
+    }
+
     if (!config_child.child("gpu").empty()) {
         const auto gpu = config_child.child("gpu");
         out.backend_renderer = gpu.attribute("backend-renderer").as_string();
@@ -267,6 +284,12 @@ bool save_custom_config(const Config::CurrentConfig &cc, const fs::path &config_
 
     auto cpu_child = config_child.append_child("cpu");
     cpu_child.append_attribute("cpu-opt") = cc.cpu_opt;
+
+    auto nova3k_child = config_child.append_child("nova3k");
+    nova3k_child.append_attribute("lock-free-monitor") = cc.nova3k_lock_free_monitor;
+    nova3k_child.append_attribute("fast-jit-init") = cc.nova3k_fast_jit_init;
+    nova3k_child.append_attribute("perf-monitor") = cc.nova3k_perf_monitor;
+    nova3k_child.append_attribute("pso2-patches") = cc.nova3k_pso2_patches;
 
     auto gpu_child = config_child.append_child("gpu");
     gpu_child.append_attribute("backend-renderer") = cc.backend_renderer.c_str();
@@ -367,13 +390,18 @@ int delete_all_custom_configs(const fs::path &config_path) {
 bool has_custom_config(const fs::path &config_path, const std::string &app_path) {
     if (app_path.empty())
         return false;
-    return fs::exists(get_custom_config_path(config_path, app_path));
+    // Nova3K: a game with a built-in profile always has per-game settings, even before the user saved any
+    return fs::exists(get_custom_config_path(config_path, app_path)) || nova3k::find_profile(app_path) != nullptr;
 }
 
 void set_current_config(Config &cfg, const fs::path &config_path, const std::string &app_path) {
     copy_global_to_current(cfg.current_config, cfg);
-    if (!app_path.empty())
-        load_custom_config(cfg.current_config, config_path, app_path);
+    if (app_path.empty())
+        return;
+    // Nova3K: the user's own per-game file wins; without one, the built-in profile is used.
+    // Deleting the per-game settings therefore returns the game to its Nova3K profile.
+    if (!load_custom_config(cfg.current_config, config_path, app_path))
+        nova3k::apply_profile(cfg.current_config, app_path);
 }
 
 void copy_current_config_to_global(Config &cfg) {

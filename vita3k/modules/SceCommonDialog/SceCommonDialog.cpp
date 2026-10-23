@@ -28,6 +28,7 @@
 #include <net/state.h>
 #include <packages/functions.h>
 #include <util/log.h>
+#include <util/nova3k_game.h>
 #include <util/string_utils.h>
 
 #include <SDL3/SDL_timer.h>
@@ -565,6 +566,16 @@ EXPORT(int, sceNetCheckDialogGetResult, SceNetCheckDialogResult *result) {
         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_IN_USE);
 
     result->result = emuenv.common_dialog.result;
+
+    // Nova3K PSO2: Game Start opens the network check dialog in PSN mode and goes on only if the dialog
+    // reports a successful PSN sign-in. The stub left psnModeSucceeded unset, so the game silently went
+    // back to the title menu. Only for PSO2 with its patches on; other games keep the original stub.
+    const auto mode = emuenv.common_dialog.netcheck.mode;
+    if (nova3k::game::pso2_active().load(std::memory_order_relaxed)
+        && (mode == SCE_NETCHECK_DIALOG_MODE_PSN || mode == SCE_NETCHECK_DIALOG_MODE_PSN_ONLINE)) {
+        result->psnModeSucceeded = SCE_TRUE;
+        LOG_INFO("Nova3K PSO2: network check dialog (mode {}) reports PSN sign-in OK", static_cast<int>(mode));
+    }
 
     if (emuenv.common_dialog.netcheck.mode != SCE_NETCHECK_DIALOG_MODE_ADHOC_CONN)
         STUBBED("result->result = 0");

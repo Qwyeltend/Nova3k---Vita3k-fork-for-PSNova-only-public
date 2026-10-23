@@ -15,6 +15,7 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <util/nova3k_game.h>
 #include <util/nova3k_perf.h>
 #include <renderer/vulkan/types.h>
 
@@ -182,6 +183,13 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
         // we must always store the depth stencil
         force_store = true;
     context.current_render_pass = context.state.pipeline_cache.retrieve_render_pass(vk_format, force_load, force_store, color_surface_fin == nullptr);
+    context.nova3k_passes_in_scene = 0;
+    context.nova3k_scene_depth_load = force_load;
+    if (nova3k::game::pso2_active().load(std::memory_order_relaxed)) {
+        const bool has_depth = context.record.depth_stencil_surface.depth_data || context.record.depth_stencil_surface.stencil_data;
+        if (has_depth)
+            nova3k::game::gfx_count(ds_surface_fin ? &nova3k::game::GfxCounters::depth_scenes_memory : &nova3k::game::GfxCounters::depth_scenes_gpu_only);
+    }
     if (context.state.features.support_shader_interlock)
         // also retrieve / create the shader interlock pass
         context.current_shader_interlock_pass = context.state.pipeline_cache.retrieve_render_pass(vk_format, true, true, color_surface_fin == nullptr, true);
@@ -331,6 +339,20 @@ void VKContext::start_render_pass(bool create_descriptor_set) {
         .renderPass = current_render_pass,
         .framebuffer = current_framebuffer
     };
+
+    // Nova3K (PSO2 diagnostics): a second render pass in the same scene clears the depth again unless
+    // it was switched to a loading pass (macroblock / shader interlock paths do that)
+    if (nova3k_passes_in_scene++ > 0 && nova3k::game::pso2_active().load(std::memory_order_relaxed)) {
+        const bool depth_loaded = nova3k_scene_depth_load || ignore_macroblock || state.features.support_shader_interlock;
+        nova3k::game::gfx_count(depth_loaded ? &nova3k::game::GfxCounters::depth_restart_kept : &nova3k::game::GfxCounters::depth_restart_cleared);
+        static int logged = 0;
+        if (!depth_loaded && logged < 20) {
+            logged++;
+            LOG_WARN("Nova3K PSO2 vulkan: render pass restarted inside a scene ({} so far), the depth buffer is cleared again (depth 0x{:X}, force load {}, force store {})",
+                nova3k_passes_in_scene, record.depth_stencil_surface.depth_data.address(),
+                static_cast<int>(record.depth_stencil_surface.force_load), static_cast<int>(record.depth_stencil_surface.force_store));
+        }
+    }
 
     if (render_target->has_macroblock_sync && !ignore_macroblock) {
         // set the render area to the correct macroblock

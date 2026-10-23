@@ -40,6 +40,11 @@
 #include <util/bytes.h>
 #include <util/log.h>
 
+#include <cstdio>
+#include <iostream>
+#include <sstream>
+#include <vector>
+
 // Credits to mmozeiko https://github.com/mmozeiko/pkg2zip
 
 static void ctr_init(uint8_t *counter, uint8_t *iv, uint64_t n) {
@@ -53,7 +58,43 @@ static void ctr_init(uint8_t *counter, uint8_t *iv, uint64_t n) {
 static int execute(std::string &zrif, fs::path &title_src, fs::path &title_dst, F00DEncryptorTypes type, std::string &f00d_arg, PfsProgressCallback progress = nullptr) {
     std::string title_src_str = title_src.string();
     std::string title_dst_str = title_dst.string();
-    return execute(zrif, title_src_str, title_dst_str, type, f00d_arg, progress);
+
+    // Nova3K: psvpfsparser reports its errors on stdout/stderr, which Android throws away.
+    // Capture them and put the important part into the log, with the free space.
+    {
+        boost::system::error_code ec;
+        const auto space = fs::space(title_src.parent_path(), ec);
+        if (!ec)
+            LOG_INFO("Nova3K: decrypting {} ({} MiB free on the device)", title_src_str, space.available / (1024 * 1024));
+    }
+    // forward every line psvpfsparser prints straight into the log, so a crash or a kill
+    // still leaves the last processed file in the log
+    struct LineLogBuf : std::streambuf {
+        std::string line;
+        int overflow(int c) override {
+            if (c == '\n') {
+                if (!line.empty())
+                    LOG_INFO("pfs: {}", line);
+                line.clear();
+            } else if (c != EOF) {
+                line += static_cast<char>(c);
+            }
+            return c;
+        }
+    } line_buf;
+    std::streambuf *old_out = std::cout.rdbuf(&line_buf);
+    std::streambuf *old_err = std::cerr.rdbuf(&line_buf);
+    int result;
+    try {
+        result = execute(zrif, title_src_str, title_dst_str, type, f00d_arg, progress);
+    } catch (const std::exception &e) {
+        LOG_ERROR("pfs exception: {}", e.what());
+        result = -1;
+    }
+    std::cout.rdbuf(old_out);
+    std::cerr.rdbuf(old_err);
+    LOG_INFO("Nova3K: psvpfsparser result {}", result);
+    return result;
 }
 
 bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, const fs::path &title_path, const std::function<void(float)> &progress_callback) {
@@ -64,19 +105,55 @@ bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, co
     F00DEncryptorTypes f00d_enc_type = F00DEncryptorTypes::native;
     std::string f00d_arg = std::string();
 
-    PfsProgressCallback pfs_progress = nullptr;
-    if (progress_callback) {
-        pfs_progress = [&progress_callback](std::uint64_t processed, std::uint64_t total, const std::string &) {
+    // Nova3K: the encrypted source folder is thrown away after decryption anyway, so shrink each
+    // encrypted file as soon as its decrypted copy is written. psvpfsparser calls the progress
+    // callback twice per file (before and after); the second call means the file is done.
+    // This halves the free space an install needs (a 17 GB patch needed 34 GB, now ~17 GB).
+    // The first 1 MiB is kept: psvpfsparser recognises files by their first sector, so an
+    // interrupted install can be resumed (finished files are listed in <dest>/.nova3k_done).
+    std::string last_path;
+    std::uint64_t freed = 0;
+    PfsProgressCallback pfs_progress = [&](std::uint64_t processed, std::uint64_t total, const std::string &path) {
+        if (progress_callback)
             progress_callback(total ? static_cast<float>(processed) / static_cast<float>(total) : 1.f);
-        };
-    }
+        if (!path.empty() && path != last_path) {
+            boost::system::error_code ec;
+            const auto size = fs::file_size(path, ec);
+            if (!ec && size >= 64ull * 1024 * 1024) {
+                long rss_pages = 0, dummy = 0;
+                if (FILE *statm = fopen("/proc/self/statm", "r")) {
+                    if (fscanf(statm, "%ld %ld", &dummy, &rss_pages) != 2)
+                        rss_pages = 0;
+                    fclose(statm);
+                }
+                LOG_INFO("Nova3K: decrypting large file {} ({} MiB), emulator memory {} MiB", path, size / (1024 * 1024),
+                    rss_pages * 4 / 1024);
+            }
+        }
+        if (!path.empty() && path == last_path) {
+            boost::system::error_code ec;
+            const auto size = fs::file_size(path, ec);
+            constexpr std::uint64_t keep = 1024 * 1024;
+            if (!ec && size > keep) {
+                fs::resize_file(path, keep, ec);
+                if (!ec)
+                    freed += size - keep;
+            }
+            last_path.clear();
+        } else {
+            last_path = path;
+        }
+    };
 
-    if ((execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress) < 0) && (title_path.string().find("theme") == std::string::npos))
+    const int pfs_result = execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress);
+    LOG_INFO("Nova3K: {} MiB of encrypted files removed during decryption", freed / (1024 * 1024));
+    if ((pfs_result < 0) && (title_path.string().find("theme") == std::string::npos))
         return false;
 
     if (!emuenv.app_info.app_category.contains("gp"))
         copy_license(emuenv, drmlicpath);
 
+    fs::remove(title_id_dst / ".nova3k_done");
     fs::remove_all(title_id_src);
     fs::rename(title_id_dst, title_id_src);
 

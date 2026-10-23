@@ -306,6 +306,10 @@ struct VKContext : public renderer::Context {
     bool in_renderpass = false;
     bool refresh_pipeline = false;
     bool is_first_scene_draw = false;
+    // Nova3K (PSO2 diagnostics): render passes started in the current scene, and whether the
+    // scene's first render pass loads the depth (otherwise every new render pass clears it)
+    uint32_t nova3k_passes_in_scene = 0;
+    bool nova3k_scene_depth_load = false;
     // command buffer used to record the current scene
     vk::CommandBuffer render_cmd{};
     // command buffer used for commands that need to be executed before render_cmd (mostly because they can't be done during a render pass)

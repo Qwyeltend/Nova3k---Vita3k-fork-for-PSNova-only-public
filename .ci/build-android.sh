@@ -10,9 +10,11 @@ if [[ -z "$OUTPUT_DIR" ]]; then
 fi
 
 # Nova3K: apply our patches to third-party submodules (idempotent)
-for patch in tools/nova3k/patches/*/*.patch; do
+# tools/nova3k/patches/<path under external/>/*.patch, e.g. psvpfstools/psvpfsparser for a nested submodule
+while IFS= read -r patch; do
     [[ -e "$patch" ]] || continue
-    module="external/$(basename "$(dirname "$patch")")"
+    rel="${patch#tools/nova3k/patches/}"
+    module="external/$(dirname "$rel")"
     if git -C "$module" apply --check "$PWD/$patch" 2>/dev/null; then
         git -C "$module" apply "$PWD/$patch"
         echo "Nova3K: applied $patch to $module"
@@ -22,7 +24,7 @@ for patch in tools/nova3k/patches/*/*.patch; do
         echo "Nova3K: $patch does not apply to $module" >&2
         exit 1
     fi
-done
+done < <(find tools/nova3k/patches -name '*.patch' | sort)
 
 mkdir -p android/app/assets
 rm -rf android/app/assets/data android/app/assets/shaders-builtin
@@ -37,8 +39,8 @@ find android/app/src/main/res -name strings.xml -path '*values*' \
 
 chmod +x android/gradlew
 
-# Nova3K: always an optimized release build, signed with the release key
-# from the repository secrets (set by the workflow), so every new APK
+# Nova3K: always an optimized release build. It is signed with the fixed
+# key from android/nova3k.jks (set by the workflow), so every new APK
 # installs over the previous one without losing data.
 BUILD_TYPE="Release"
 

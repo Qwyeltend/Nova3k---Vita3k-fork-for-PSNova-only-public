@@ -43,6 +43,10 @@ struct EmulatorConfigFields {
     jfieldID modulesMode = nullptr;
     jfieldID lleModules = nullptr;
     jfieldID cpuOpt = nullptr;
+    jfieldID nova3kLockFreeMonitor = nullptr;
+    jfieldID nova3kFastJitInit = nullptr;
+    jfieldID nova3kPerfMonitor = nullptr;
+    jfieldID nova3kPso2Patches = nullptr;
     jfieldID backendRenderer = nullptr;
     jfieldID highAccuracy = nullptr;
     jfieldID resolutionMultiplier = nullptr;
@@ -128,6 +132,10 @@ EmulatorConfigFields resolve_config_fields(JNIEnv *env) {
     fields.modulesMode = env->GetFieldID(fields.cls, "modulesMode", "I");
     fields.lleModules = env->GetFieldID(fields.cls, "lleModules", "[Ljava/lang/String;");
     fields.cpuOpt = env->GetFieldID(fields.cls, "cpuOpt", "Z");
+    fields.nova3kLockFreeMonitor = env->GetFieldID(fields.cls, "nova3kLockFreeMonitor", "I");
+    fields.nova3kFastJitInit = env->GetFieldID(fields.cls, "nova3kFastJitInit", "I");
+    fields.nova3kPerfMonitor = env->GetFieldID(fields.cls, "nova3kPerfMonitor", "I");
+    fields.nova3kPso2Patches = env->GetFieldID(fields.cls, "nova3kPso2Patches", "I");
     fields.backendRenderer = env->GetFieldID(fields.cls, "backendRenderer", "Ljava/lang/String;");
     fields.highAccuracy = env->GetFieldID(fields.cls, "highAccuracy", "Z");
     fields.resolutionMultiplier = env->GetFieldID(fields.cls, "resolutionMultiplier", "F");
@@ -296,6 +304,10 @@ void fill_config_object(JNIEnv *env, jobject obj, const EmulatorConfigFields &fi
         env->DeleteLocalRef(string_class);
     }
     env->SetBooleanField(obj, fields.cpuOpt, current_config.cpu_opt);
+    env->SetIntField(obj, fields.nova3kLockFreeMonitor, static_cast<jint>(current_config.nova3k_lock_free_monitor));
+    env->SetIntField(obj, fields.nova3kFastJitInit, static_cast<jint>(current_config.nova3k_fast_jit_init));
+    env->SetIntField(obj, fields.nova3kPerfMonitor, static_cast<jint>(current_config.nova3k_perf_monitor));
+    env->SetIntField(obj, fields.nova3kPso2Patches, static_cast<jint>(current_config.nova3k_pso2_patches));
     {
         jstring value = env->NewStringUTF(current_config.backend_renderer.c_str());
         env->SetObjectField(obj, fields.backendRenderer, value);
@@ -432,6 +444,10 @@ void read_config_object(JNIEnv *env, jobject obj, const EmulatorConfigFields &fi
         }
     }
     current_config.cpu_opt = env->GetBooleanField(obj, fields.cpuOpt) != JNI_FALSE;
+    current_config.nova3k_lock_free_monitor = static_cast<int>(env->GetIntField(obj, fields.nova3kLockFreeMonitor));
+    current_config.nova3k_fast_jit_init = static_cast<int>(env->GetIntField(obj, fields.nova3kFastJitInit));
+    current_config.nova3k_perf_monitor = static_cast<int>(env->GetIntField(obj, fields.nova3kPerfMonitor));
+    current_config.nova3k_pso2_patches = static_cast<int>(env->GetIntField(obj, fields.nova3kPso2Patches));
     {
         auto *value = reinterpret_cast<jstring>(env->GetObjectField(obj, fields.backendRenderer));
         if (value) {

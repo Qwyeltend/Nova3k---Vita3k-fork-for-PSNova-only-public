@@ -1,0 +1,19 @@
+# Nova3K: runs PhantasyServer (master ship + ship server) inside the Nova3K emulator process,
+# so Phantasy Star Online 2 (PS Vita) can be played offline on the device.
+# PhantasyServer is the work of Anton Maltsev (MIT license, see ../LICENSE). Thank you!
+[package]
+name = "nova3k_embed"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+master_ship = { path = "../master_ship" }
+pso2ship_server = { path = "../ship_server" }
+# the same features a whole-workspace build turns on (data_structs uses serde_json under "ship")
+data_structs = { path = "../data_structs", features = ["rmp", "ship", "json", "toml"] }
+tokio = { version = "1.52.1", features = ["full"] }
+log = { version = "0.4.29", features = ["std"] }

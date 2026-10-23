@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -1151,6 +1152,12 @@ private fun AppActionsDialog(
     onCustomConfig: () -> Unit = {}
 ) {
     var showDeleteSubmenu by remember { mutableStateOf(false) }
+    var showPso2EnglishPatch by remember { mutableStateOf(false) }
+
+    if (showPso2EnglishPatch) {
+        Pso2EnglishPatchDialog(onDismiss = { showPso2EnglishPatch = false; onDismiss() })
+        return
+    }
 
     if (showDeleteSubmenu) {
         val availableDeletes = AppAction.entries
@@ -1218,6 +1225,22 @@ private fun AppActionsDialog(
             },
             onClick = { onCustomConfig() }
         )
+
+        // Nova3K: PSO2 fan translation installer
+        if (app.titleId == Pso2EnglishPatch.TITLE_ID) {
+            AppMenuRow(
+                label = stringResource(R.string.pso2_en_patch_menu),
+                icon = {
+                    Icon(
+                        Icons.Default.Translate,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                },
+                onClick = { showPso2EnglishPatch = true }
+            )
+        }
 
         // Other actions (reset last played, etc.)
         otherActions.forEach { action ->

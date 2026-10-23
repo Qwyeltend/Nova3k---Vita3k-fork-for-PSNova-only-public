@@ -367,6 +367,19 @@
     <string name="settings_cpu_opt">Enable CPU Optimizations</string>
     <string name="settings_cpu_opt_desc">Enable Dynarmic JIT optimizations. Improves performance.</string>
     <string name="settings_cpu_dynarmic_settings">Dynarmic Settings</string>
+    <string name="settings_nova3k_tweaks">Nova3K tweaks</string>
+    <string name="settings_nova3k_mode_auto">Auto</string>
+    <string name="settings_nova3k_mode_on">On</string>
+    <string name="settings_nova3k_mode_off">Off</string>
+    <string name="settings_nova3k_lock_free_monitor">Lock-free atomics</string>
+    <string name="settings_nova3k_lock_free_monitor_desc">Runs the game\'s atomic operations (LDREX/STREX) without the JIT\'s global lock. Big FPS gain in Phantasy Star Nova.\n\nAuto: on for games with a Nova3K profile, off for the rest. Off: original Vita3K behaviour. Takes effect on the next game start.</string>
+    <string name="settings_nova3k_fast_jit_init">Fast JIT start</string>
+    <string name="settings_nova3k_fast_jit_init_desc">When the game starts a thread, flush only the few kilobytes the JIT actually wrote instead of the whole 128 MiB code cache. Removes stutter when games create threads.\n\nAuto: on for games with a Nova3K profile. Off: original Vita3K behaviour. Takes effect on the next game start.</string>
+    <string name="settings_nova3k_perf_monitor">Performance monitor</string>
+    <string name="settings_nova3k_perf_monitor_desc">Writes a short performance line to vita3k.log every second (FPS, frame times, slow guest calls, audio underruns). Useful for bug reports.\n\nAuto: on for games with a Nova3K profile. Takes effect on the next game start.</string>
+    <string name="settings_nova3k_pso2_patches">PSO2 patches</string>
+    <string name="settings_nova3k_pso2_patches_desc">Phantasy Star Online 2 only. Restores the original Game Start action (the final 6.31 client replaced it with the "service ended" notice) and writes the game\'s network activity (server names and addresses) to vita3k.log. Other games are not affected.\n\nAuto: on for PSO2. Off: the game runs unmodified. Takes effect on the next game start.</string>
+    <string name="settings_nova3k_profile_note">Games with a Nova3K profile (Phantasy Star Nova, Phantasy Star Online 2) come with working settings. Deleting this game\'s custom settings brings the profile back.</string>
 
     <!-- Settings — GPU tab -->
     <string name="settings_gpu_renderer_section">Renderer</string>
@@ -743,4 +756,21 @@
     <string name="trophy_detail_earned_label">Earned</string>
     <string name="trophy_detail_description_label">Details</string>
     <string name="trophy_not_yet_earned">Not yet earned</string>
+    <!-- Nova3K: PSO2 English patch installer (the translation itself is by Arks-Layer and is not included) -->
+    <string name="pso2_en_patch_menu">English patch (Arks-Layer)…</string>
+    <string name="pso2_en_patch_title">PSO2 English patch</string>
+    <string name="pso2_en_patch_about">Installs a fan translation you already have as a file (usually 999.cpk). The English translation is the work of the Arks-Layer team (arks-layer.com), thank you! It is not part of Nova3K: get the file from them.\n\nThe file is copied to the game\'s patch folder (data/vita/patches/999.cpk), where the game loads it after its own patches. Remove it here to go back to Japanese. Takes effect the next time the game starts.</string>
+    <string name="pso2_en_patch_status_none">Status: not installed (Japanese text)</string>
+    <string name="pso2_en_patch_status_installed">Status: installed (patch dated %1$s, %2$d MB)</string>
+    <string name="pso2_en_patch_status_no_game">Status: PSO2 (PCSG00141) is not installed in Nova3K</string>
+    <string name="pso2_en_patch_choose">Choose file…</string>
+    <string name="pso2_en_patch_remove">Remove patch</string>
+    <string name="pso2_en_patch_close">Close</string>
+    <string name="pso2_en_patch_installing">Copying…</string>
+    <string name="pso2_en_patch_done">Installed (patch dated %1$s). Start the game to see it.</string>
+    <string name="pso2_en_patch_removed">Removed. The game is back to Japanese.</string>
+    <string name="pso2_en_patch_error_no_game">PSO2 (PCSG00141) is not installed in Nova3K.</string>
+    <string name="pso2_en_patch_error_read">Cannot read the chosen file.</string>
+    <string name="pso2_en_patch_error_not_cpk">This is not a PSO2 text patch (expected a CRI .cpk archive with .ice text files, like 999.cpk). Nothing was changed.</string>
+    <string name="pso2_en_patch_error_write">Cannot write to the game folder. Nothing was changed.</string>
 </resources>

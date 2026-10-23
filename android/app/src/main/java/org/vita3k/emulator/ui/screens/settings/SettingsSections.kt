@@ -433,6 +433,55 @@ private fun CoreSettingsSection(
                 ),
                 onShowHelp = onShowHelp
             )
+
+            // Nova3K: per-game switches for our changes (0 = auto, 1 = on, 2 = off)
+            SettingsSubsectionTitle(title = stringResource(R.string.settings_nova3k_tweaks))
+            Text(
+                text = stringResource(R.string.settings_nova3k_profile_note),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            val nova3kModes = listOf(
+                stringResource(R.string.settings_nova3k_mode_auto),
+                stringResource(R.string.settings_nova3k_mode_on),
+                stringResource(R.string.settings_nova3k_mode_off)
+            )
+            val lockFreeTitle = stringResource(R.string.settings_nova3k_lock_free_monitor)
+            SettingsChoiceField(
+                title = lockFreeTitle,
+                options = nova3kModes,
+                selectedIndex = cfg.nova3kLockFreeMonitor.coerceIn(0, 2),
+                onSelect = { index -> onUpdate { nova3kLockFreeMonitor = index } },
+                help = helpEntry(lockFreeTitle, stringResource(R.string.settings_nova3k_lock_free_monitor_desc)),
+                onShowHelp = onShowHelp
+            )
+            val fastJitTitle = stringResource(R.string.settings_nova3k_fast_jit_init)
+            SettingsChoiceField(
+                title = fastJitTitle,
+                options = nova3kModes,
+                selectedIndex = cfg.nova3kFastJitInit.coerceIn(0, 2),
+                onSelect = { index -> onUpdate { nova3kFastJitInit = index } },
+                help = helpEntry(fastJitTitle, stringResource(R.string.settings_nova3k_fast_jit_init_desc)),
+                onShowHelp = onShowHelp
+            )
+            val perfTitle = stringResource(R.string.settings_nova3k_perf_monitor)
+            SettingsChoiceField(
+                title = perfTitle,
+                options = nova3kModes,
+                selectedIndex = cfg.nova3kPerfMonitor.coerceIn(0, 2),
+                onSelect = { index -> onUpdate { nova3kPerfMonitor = index } },
+                help = helpEntry(perfTitle, stringResource(R.string.settings_nova3k_perf_monitor_desc)),
+                onShowHelp = onShowHelp
+            )
+            val pso2Title = stringResource(R.string.settings_nova3k_pso2_patches)
+            SettingsChoiceField(
+                title = pso2Title,
+                options = nova3kModes,
+                selectedIndex = cfg.nova3kPso2Patches.coerceIn(0, 2),
+                onSelect = { index -> onUpdate { nova3kPso2Patches = index } },
+                help = helpEntry(pso2Title, stringResource(R.string.settings_nova3k_pso2_patches_desc)),
+                onShowHelp = onShowHelp
+            )
         }
     }
 

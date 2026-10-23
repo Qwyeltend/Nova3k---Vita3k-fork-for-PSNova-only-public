@@ -80,6 +80,15 @@ static bool nova3k_transfer_through_surface_cache(State &renderer, MemState &mem
     return true;
 }
 
+// Nova3K (PSO2): the transfer below ran on the CPU and wrote guest memory; tell the surface cache so a
+// color surface living there is reloaded from memory before it is used again (see
+// VKSurfaceCache::nova3k_reload_surface_from_memory).
+static void nova3k_after_cpu_transfer(State &renderer, Address dst_address) {
+    if (renderer.current_backend != Backend::Vulkan || !nova3k::game::pso2_active())
+        return;
+    dynamic_cast<vulkan::VKState &>(renderer).surface_cache.nova3k_cpu_wrote(dst_address);
+}
+
 template <typename T, SceGxmTransferColorKeyMode mode, SceGxmTransferType src_type, SceGxmTransferType dst_type>
 static void perform_transfer_copy_impl(MemState &mem, const SceGxmTransferImage &src, const SceGxmTransferImage &dst, uint32_t key_value, uint32_t key_mask) {
     T *__restrict__ src_ptr = src.address.cast<T>().get(mem);
@@ -228,13 +237,17 @@ COMMAND(handle_transfer_copy) {
         delete[] images;
     };
 
+    const Address nova3k_dst = images[1].address.address();
     if (renderer.current_backend == Backend::Vulkan && renderer.features.enable_memory_mapping && !renderer.disable_surface_sync) {
         // let the vulkan surface cache handle it (Nova3K: and wait for it)
-        if (nova3k_transfer_through_surface_cache(renderer, mem, images[0].address.address(), images[1].address.address(), copy_operation, "transfer copy"))
+        if (nova3k_transfer_through_surface_cache(renderer, mem, images[0].address.address(), images[1].address.address(), copy_operation, "transfer copy")) {
+            nova3k_after_cpu_transfer(renderer, nova3k_dst);
             return;
+        }
     }
 
     copy_operation();
+    nova3k_after_cpu_transfer(renderer, nova3k_dst);
 }
 
 COMMAND(handle_transfer_downscale) {
@@ -251,6 +264,8 @@ COMMAND(handle_transfer_downscale) {
     const uint32_t pixel_bytes = gxm::get_bits_per_pixel(src->format) / 8;
     src->address = (src->address.cast<uint8_t>() + src->y * src->stride + src->x * pixel_bytes).cast<void>();
     dst->address = (dst->address.cast<uint8_t>() + dst->y * dst->stride + dst->x * pixel_bytes).cast<void>();
+
+    const Address nova3k_dst = dst->address.address(); // dst is deleted by the operation
 
     // only rgb formats are supported by the PS Vita for downscaling
     vulkan::CallbackRequestFunction downscale_operation = [&mem, src, dst]() {
@@ -321,12 +336,23 @@ COMMAND(handle_transfer_downscale) {
     };
 
     if (renderer.current_backend == Backend::Vulkan && renderer.features.enable_memory_mapping && !renderer.disable_surface_sync) {
-        // let the vulkan surface cache handle it (Nova3K: and wait for it)
-        if (nova3k_transfer_through_surface_cache(renderer, mem, src->address.address(), dst->address.address(), downscale_operation, "transfer downscale"))
+        // Nova3K (PSO2): scale on the GPU, no readback and no wait (see VKSurfaceCache::nova3k_gpu_downscale)
+        if (nova3k::game::pso2_active().load(std::memory_order_relaxed) && src->format == SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR && src->stride > 0 && dst->stride > 0
+            && dynamic_cast<vulkan::VKState &>(renderer).surface_cache.nova3k_gpu_downscale(mem, src->address.address(), src->width, src->height, static_cast<uint32_t>(src->stride),
+                nova3k_dst, dst->width, dst->height, static_cast<uint32_t>(dst->stride))) {
+            delete src;
+            delete dst;
             return;
+        }
+        // let the vulkan surface cache handle it (Nova3K: and wait for it)
+        if (nova3k_transfer_through_surface_cache(renderer, mem, src->address.address(), nova3k_dst, downscale_operation, "transfer downscale")) {
+            nova3k_after_cpu_transfer(renderer, nova3k_dst);
+            return;
+        }
     }
 
     downscale_operation();
+    nova3k_after_cpu_transfer(renderer, nova3k_dst);
 }
 
 COMMAND(handle_transfer_fill) {
@@ -351,6 +377,7 @@ COMMAND(handle_transfer_fill) {
     }
 
     // TODO: handle case where dest is a cached surface
+    nova3k_after_cpu_transfer(renderer, dest->address.address());
 
     delete dest;
 }

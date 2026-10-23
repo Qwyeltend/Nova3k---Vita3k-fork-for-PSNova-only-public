@@ -1,0 +1,68 @@
+[
+  {
+    "attack_name": "Unarmed:AA1Damage",
+    "damage_name": "Unarmed:AA1DamageA",
+    "attack_type": "Mel",
+    "defense_type": "Mel",
+    "damage": {
+      "Generic": {
+        "mul": 3.64
+      }
+    }
+  },
+  {
+    "attack_name": "Unarmed:AA2Damage",
+    "damage_name": "Unarmed:AA2DamageA",
+    "attack_type": "Mel",
+    "defense_type": "Mel",
+    "damage": {
+      "Generic": {
+        "mul": 5
+      }
+    }
+  },
+  {
+    "attack_name": "Unarmed:AA3Damage",
+    "damage_name": "Unarmed:AA3DamageA",
+    "attack_type": "Mel",
+    "defense_type": "Mel",
+    "damage": {
+      "Generic": {
+        "mul": 4.92
+      }
+    }
+  },
+  {
+    "attack_name": "Unarmed:GA1Damage",
+    "damage_name": "Unarmed:GA1DamageA",
+    "attack_type": "Mel",
+    "defense_type": "Mel",
+    "damage": {
+      "Generic": {
+        "mul": 3.64
+      }
+    }
+  },
+  {
+    "attack_name": "Unarmed:GA2Damage",
+    "damage_name": "Unarmed:GA2DamageA",
+    "attack_type": "Mel",
+    "defense_type": "Mel",
+    "damage": {
+      "Generic": {
+        "mul": 5
+      }
+    }
+  },
+  {
+    "attack_name": "Unarmed:GA3Damage",
+    "damage_name": "Unarmed:GA3DamageA",
+    "attack_type": "Mel",
+    "defense_type": "Mel",
+    "damage": {
+      "Generic": {
+        "mul": 4.92
+      }
+    }
+  }
+]

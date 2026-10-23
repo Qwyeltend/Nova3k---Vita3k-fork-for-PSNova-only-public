@@ -1,0 +1,70 @@
+diff --git a/PfsFilesystem.cpp b/PfsFilesystem.cpp
+index eacacf8..ecb580f 100644
+--- a/PfsFilesystem.cpp
++++ b/PfsFilesystem.cpp
+@@ -3,6 +3,9 @@
+ #include "PfsFile.h"
+ 
+ #include <cstring>
++#include <fstream>
++#include <set>
++#include <string>
+ 
+ PfsFilesystem::PfsFilesystem(std::shared_ptr<ICryptoOperations> cryptops, std::shared_ptr<IF00DKeyEncryptor> iF00D, std::ostream& output,
+                  const unsigned char* klicensee, const psvpfs::path& titleIdPath)
+@@ -115,6 +118,24 @@ int PfsFilesystem::decrypt_files(const psvpfs::path& destTitleIdPath, PfsProgres
+ 
+    std::uint64_t processed_bytes = 0;
+ 
++   // Nova3K: resumable decryption. Every finished file is appended to <dest>/.nova3k_done;
++   // a later run skips those files (their encrypted source may already be truncated).
++   const psvpfs::path done_list_path = destTitleIdPath / ".nova3k_done";
++   std::set<std::string> done_files;
++   {
++      std::ifstream done_in(done_list_path.string());
++      for (std::string line; std::getline(done_in, line);)
++         if (!line.empty())
++            done_files.insert(line);
++   }
++   if (!done_files.empty())
++      m_output << "Resuming: " << done_files.size() << " files already decrypted" << std::endl;
++   auto mark_done = [&](const std::string& key) {
++      std::ofstream done_out(done_list_path.string(), std::ios::app);
++      done_out << key << '\n';
++      done_out.flush();
++   };
++
+    for(auto& t : unicv->m_tables)
+    {
+       //skip empty files and directories
+@@ -145,6 +166,14 @@ int PfsFilesystem::decrypt_files(const psvpfs::path& destTitleIdPath, PfsProgres
+       }
+       auto &file = file_ptr->second;
+ 
++      const std::string done_key = filepath.get_value().string();
++      if (done_files.count(done_key))
++      {
++         m_output << "Already decrypted: " << filepath << std::endl;
++         processed_bytes += file->file.m_info.header.size;
++         continue;
++      }
++
+       //directory and unexisting file are unexpected
+       if(is_directory(file->file.m_info.header.type) || is_unexisting(file->file.m_info.header.type))
+       {
+@@ -162,6 +191,7 @@ int PfsFilesystem::decrypt_files(const psvpfs::path& destTitleIdPath, PfsProgres
+          else
+          {
+             m_output << "Copied: " << filepath << std::endl;
++            mark_done(done_key);
+          }
+       }
+       //decrypt encrypted files
+@@ -177,6 +207,7 @@ int PfsFilesystem::decrypt_files(const psvpfs::path& destTitleIdPath, PfsProgres
+          else
+          {
+             m_output << "Decrypted: " << filepath << std::endl;
++            mark_done(done_key);
+          }
+       }
+       else

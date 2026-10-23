@@ -1,0 +1,82 @@
+# Nova3K: quick check of the PSO2 offline server (PhantasyServer by Anton Maltsev, MIT) for Android.
+# Builds only the Rust library (a few minutes instead of the full APK) and publishes the build log
+# and the library as the "pso2-server-check" release. Started by hand.
+name: Nova3K PSO2 server check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: external/phantasyserver
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - name: Build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          mkdir -p out
+          set -o pipefail
+          status=0
+          {
+            set -e
+            cargo install cargo-ndk --locked
+            cd external/phantasyserver
+            cargo run --release -p data_compiler -- data
+            ls -l data/com_data.mp
+            export NOVA3K_COM_DATA="$PWD/data/com_data.mp"
+            cargo ndk -t arm64-v8a --platform 28 build --release -p nova3k_embed
+            ls -l target/aarch64-linux-android/release/libnova3k_embed.a
+            bash ../../tools/nova3k/pso2-server-lua.sh
+            cp target/aarch64-linux-android/release/libnova3k_embed.a ../../out/
+          } 2>&1 | tee out/pso2-server-build.log || status=$?
+          echo "exit status: $status" | tee -a out/pso2-server-build.log
+          # Nova3K: a failed server build must fail the check (it used to report success)
+          [ "$status" = 0 ] || { echo "::error::PSO2 server build failed"; exit 1; }
+
+      - name: Smoke test (run the server on the PC and talk to it like the Vita)
+        run: |
+          mkdir -p out
+          {
+            cd external/phantasyserver
+            export NOVA3K_COM_DATA="$PWD/data/com_data.mp"
+            cargo build --release -p nova3k_embed --example smoke
+            ./target/release/examples/smoke /tmp/pso2_smoke 45 > ../../out/pso2-smoke-server.log 2>&1 &
+            sleep 8
+            pip install --quiet cryptography
+            timeout 30 python3 ../../tools/nova3k/pso2_smoke_client.py ../../vita3k/nova3k/pso2_key.h; echo "client exit: $?"
+            sleep 2
+            echo "== server log =="; cat ../../out/pso2-smoke-server.log
+          } 2>&1 | tee out/pso2-smoke.log
+
+      - name: Pack pso2packetlib source (packet definitions, MIT)
+        if: always()
+        run: |
+          mkdir -p out
+          cd ~/.cargo/registry/src/*/ && tar czf $GITHUB_WORKSPACE/out/pso2packetlib-src.tar.gz pso2packetlib* || true
+
+      - name: Publish
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete pso2-server-check --yes --cleanup-tag || true
+          gh release create pso2-server-check out/* --title "PSO2 server check ($(git rev-parse --short HEAD))" \
+            --notes "Build log of the PSO2 offline server library" --target "${{ github.sha }}" --prerelease

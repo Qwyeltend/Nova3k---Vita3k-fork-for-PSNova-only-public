@@ -1,0 +1,176 @@
+[
+ {
+  "zone_id": 2,
+  "is_active": true,
+  "data": {
+   "object": {
+    "id": 950,
+    "unk": 0,
+    "entity_type": "Object",
+    "map_id": 301
+   },
+   "position": {
+    "rot_x": 0,
+    "rot_y": 15360,
+    "rot_z": 0,
+    "rot_w": 0,
+    "pos_x": 22408,
+    "pos_y": 47514,
+    "pos_z": 22808
+   },
+   "unk1": 0,
+   "name": "oa_telepipe_start",
+   "unk2": [
+    16,
+    0,
+    0,
+    0,
+    0
+   ],
+   "flags": 4,
+   "data": [
+    1560,
+    15795201,
+    2,
+    0,
+    0,
+    0,
+    256,
+    4,
+    58,
+    4294967295,
+    55,
+    1,
+    57,
+    0,
+    66,
+    1,
+    67,
+    0,
+    71,
+    1,
+    2,
+    0,
+    0,
+    0
+   ]
+  },
+  "lua_data": null
+ },
+ {
+  "zone_id": 3,
+  "is_active": true,
+  "data": {
+   "object": {
+    "id": 960,
+    "unk": 0,
+    "entity_type": "Object",
+    "map_id": 301
+   },
+   "position": {
+    "rot_x": 0,
+    "rot_y": 15360,
+    "rot_z": 0,
+    "rot_w": 0,
+    "pos_x": 22408,
+    "pos_y": 47514,
+    "pos_z": 22808
+   },
+   "unk1": 0,
+   "name": "oa_telepipe_start",
+   "unk2": [
+    16,
+    0,
+    0,
+    0,
+    0
+   ],
+   "flags": 4,
+   "data": [
+    1560,
+    15795201,
+    2,
+    0,
+    0,
+    0,
+    256,
+    4,
+    58,
+    4294967295,
+    55,
+    1,
+    57,
+    0,
+    66,
+    1,
+    67,
+    0,
+    71,
+    1,
+    2,
+    0,
+    0,
+    0
+   ]
+  },
+  "lua_data": null
+ },
+ {
+  "zone_id": 4,
+  "is_active": true,
+  "data": {
+   "object": {
+    "id": 990,
+    "unk": 0,
+    "entity_type": "Object",
+    "map_id": 301
+   },
+   "position": {
+    "rot_x": 0,
+    "rot_y": 15360,
+    "rot_z": 0,
+    "rot_w": 0,
+    "pos_x": 50176,
+    "pos_y": 49152,
+    "pos_z": 21056
+   },
+   "unk1": 0,
+   "name": "oa_telepipe_start",
+   "unk2": [
+    16,
+    0,
+    0,
+    0,
+    0
+   ],
+   "flags": 4,
+   "data": [
+    1560,
+    15795201,
+    2,
+    0,
+    0,
+    0,
+    256,
+    4,
+    58,
+    4294967295,
+    55,
+    1,
+    57,
+    0,
+    66,
+    1,
+    67,
+    0,
+    71,
+    1,
+    2,
+    0,
+    0,
+    0
+   ]
+  },
+  "lua_data": null
+ }
+]

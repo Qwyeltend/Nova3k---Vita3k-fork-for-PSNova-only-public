@@ -23,6 +23,7 @@
 #include <renderer/functions.h>
 
 #include <util/log.h>
+#include <util/nova3k_game.h>
 
 namespace renderer::vulkan {
 
@@ -226,6 +227,9 @@ void sync_visibility_buffer(VKContext &context, Ptr<uint32_t> buffer, uint32_t s
     }
 
     context.current_visibility_buffer = &ite->second;
+    // Nova3K (PSO2 diagnostics): remember the buffer so the frame capture can log its values
+    nova3k::game::gfx_counters().vis_buffer_address.store(buffer.address(), std::memory_order_relaxed);
+    nova3k::game::gfx_counters().vis_buffer_entries.store(ite->second.size, std::memory_order_relaxed);
 }
 
 void sync_visibility_index(VKContext &context, bool enable, uint32_t index, bool is_increment) {
@@ -257,6 +261,7 @@ void sync_visibility_index(VKContext &context, bool enable, uint32_t index, bool
     }
     context.current_query_idx = index;
     context.is_query_op_increment = is_increment;
+    nova3k::game::gfx_count(is_increment ? &nova3k::game::GfxCounters::vis_queries_increment : &nova3k::game::GfxCounters::vis_queries_set);
 }
 
 void refresh_pipeline(VKContext &context) {

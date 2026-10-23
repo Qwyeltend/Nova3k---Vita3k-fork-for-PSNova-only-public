@@ -16,6 +16,21 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <util/nova3k_perf.h>
+#include <util/nova3k_game.h>
+
+#include <algorithm>
+#include <atomic>
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
+#include <chrono>
+#include <vector>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 #include "SceGxm.h"
 
 #include <modules/module_parent.h>
@@ -893,6 +908,260 @@ std::string to_debug_str<SceGxmTransferFlags>(const MemState &mem, SceGxmTransfe
     return std::to_string(type);
 }
 
+// Nova3K: PSO2 only - log what the game does with GXM contexts and deferred command lists (a few
+// lines each, so the log stays readable). Used to find the character creator crash.
+static bool nova3k_gxm_log(std::atomic<int> &counter, const int limit) {
+    if (!nova3k::game::pso2_active().load(std::memory_order_relaxed))
+        return false;
+    return counter.fetch_add(1, std::memory_order_relaxed) < limit;
+}
+
+static size_t nova3k_count_commands(const renderer::CommandList &list) {
+    size_t n = 0;
+    for (const renderer::Command *c = list.first; c && n < 1000000; c = (c == list.last) ? nullptr : c->next)
+        ++n;
+    return n;
+}
+
+// Nova3K: PSO2 only - keep track of the renderer commands allocated on the host heap (when the
+// command ring is full). The character creator crashed the render thread while freeing one of them
+// (abort in the allocator: freed twice, or not a heap block). A command that is not in this set is
+// logged and not freed again, instead of crashing.
+namespace {
+struct Nova3kHostCommands {
+    std::mutex mutex;
+    std::unordered_set<const renderer::Command *> live;
+    std::atomic<int> logs{ 0 };
+};
+Nova3kHostCommands &nova3k_host_commands() {
+    static Nova3kHostCommands tracker;
+    return tracker;
+}
+} // namespace
+
+// Nova3K: PSO2 only - every ~5 seconds, describe one whole frame in vita3k.log ("Nova3K PSO2 frame"):
+// the render targets of each scene, how many draws, which textures were bound and every transfer
+// (copy / downscale / fill). Comparing a normal frame with a white-screen frame shows which pass breaks.
+namespace {
+struct Nova3kFrameDump {
+    std::mutex mutex;
+    uint64_t frame = 0;
+    int dumps = 0;
+    bool active = false;
+    std::string text;
+    uint32_t scene_draws = 0;
+    std::map<uint32_t, std::string> scene_textures;
+};
+Nova3kFrameDump &nova3k_frame() {
+    static Nova3kFrameDump dump;
+    return dump;
+}
+bool nova3k_frame_on() {
+    return nova3k::game::pso2_active().load(std::memory_order_relaxed) && nova3k_frame().active;
+}
+void nova3k_frame_note(const std::string &line) {
+    auto &d = nova3k_frame();
+    std::lock_guard<std::mutex> lock(d.mutex);
+    if (d.active && d.text.size() < 60000)
+        d.text += line + "\n";
+}
+void nova3k_frame_texture(const SceGxmTexture &texture) {
+    auto &d = nova3k_frame();
+    std::lock_guard<std::mutex> lock(d.mutex);
+    if (!d.active || d.scene_textures.size() >= 48)
+        return;
+    const uint32_t address = texture.data_addr << 2;
+    if (!d.scene_textures.contains(address))
+        d.scene_textures[address] = fmt::format("0x{:X} {}x{} fmt 0x{:X} type 0x{:X}", address, gxm::get_width(texture), gxm::get_height(texture),
+            fmt::underlying(gxm::get_format(texture)), fmt::underlying(texture.texture_type()));
+}
+void nova3k_frame_end_scene() {
+    auto &d = nova3k_frame();
+    std::lock_guard<std::mutex> lock(d.mutex);
+    if (!d.active)
+        return;
+    d.text += fmt::format("    {} draws, {} textures:", d.scene_draws, d.scene_textures.size());
+    for (const auto &[address, desc] : d.scene_textures)
+        d.text += " [" + desc + "]";
+    d.text += "\n";
+    d.scene_draws = 0;
+    d.scene_textures.clear();
+}
+std::string nova3k_ds_desc(const SceGxmDepthStencilSurface *ds) {
+    if (!ds)
+        return "no";
+    return fmt::format("0x{:X} stencil 0x{:X} force load {} store {} background {}", ds->depth_data.address(), ds->stencil_data.address(),
+        static_cast<int>(ds->force_load), static_cast<int>(ds->force_store), ds->background_depth);
+}
+void nova3k_frame_boundary() {
+    if (!nova3k::game::pso2_active().load(std::memory_order_relaxed))
+        return;
+    auto &d = nova3k_frame();
+    std::lock_guard<std::mutex> lock(d.mutex);
+    if (d.active) {
+        LOG_INFO("Nova3K PSO2 frame #{}:\n{}", d.frame, d.text);
+        d.active = false;
+        d.text.clear();
+    }
+    d.frame++;
+    if (d.frame % 150 == 0 && d.dumps < 60) {
+        d.active = true;
+        d.dumps++;
+        d.scene_draws = 0;
+        d.scene_textures.clear();
+    }
+}
+
+// Nova3K PSO2: memory search for the enemy model id. Every enemy the built-in server spawns appears as
+// a Dagan: the spawn packet (0x08 0x0D) carries a 32-bit value (unk9[12], client struct offset 0x90) that
+// PhantasyServer copied from a captured Dagan spawn (0x5DA08B21). Its meaning for other enemies is not known.
+// When the server asks for it (file pso2_server/nova3k_memscan.req, written on the first enemy spawn and by
+// the `!scan` chat command), the game's memory is searched for the known values and the names of a few
+// enemies, and the bytes around each hit go to the log: the client's enemy table shows how the value is made.
+void nova3k_hex_dump(const std::string &title, const uint8_t *p, Address at, uint32_t size) {
+    std::string text = title;
+    for (uint32_t i = 0; i < size; i += 16) {
+        text += fmt::format("\n    {:08X} ", at + i);
+        std::string ascii;
+        for (uint32_t j = 0; j < 16 && i + j < size; j++) {
+            const uint8_t c = p[i + j];
+            text += fmt::format("{:02X} ", c);
+            ascii += (c >= 32 && c < 127) ? static_cast<char>(c) : '.';
+        }
+        text += " " + ascii;
+    }
+    LOG_INFO("{}", text);
+}
+
+// Reads guest memory without faulting: a page the allocator counts as used can still be unmapped on the
+// host (the end of a module segment) - reading it directly crashed the emulator (boss zone, 0b2b69f).
+bool nova3k_safe_read(void *dst, const void *src, size_t size) {
+#if defined(__linux__) || defined(__ANDROID__)
+    iovec local{ dst, size };
+    iovec remote{ const_cast<void *>(src), size };
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(size);
+#else
+    (void)dst;
+    (void)src;
+    (void)size;
+    return false;
+#endif
+}
+
+void nova3k_pso2_memscan(EmuEnvState &emuenv) {
+    static uint64_t frames = 0;
+    if (++frames % 120 != 0 || !nova3k::game::pso2_active().load(std::memory_order_relaxed))
+        return;
+    const fs::path request = emuenv.vita_fs_path / "pso2_server" / "nova3k_memscan.req";
+    boost::system::error_code ec;
+    if (!fs::exists(request, ec))
+        return;
+    fs::remove(request, ec);
+    static int scans = 0;
+    if (++scans > 6)
+        return;
+    const auto started = std::chrono::steady_clock::now();
+    MemState &mem = emuenv.mem;
+    constexpr uint32_t page = 4096;
+    // contiguous allocated guest ranges
+    std::vector<std::pair<Address, uint32_t>> ranges;
+    for (uint64_t a = page; a < 0x100000000ull; a += page) {
+        if (!is_valid_addr(mem, static_cast<Address>(a)))
+            continue;
+        if (!ranges.empty() && ranges.back().first + ranges.back().second == a && ranges.back().second < 64 * 1024 * 1024)
+            ranges.back().second += page;
+        else
+            ranges.emplace_back(static_cast<Address>(a), page);
+    }
+    struct Needle {
+        std::string name;
+        std::vector<uint8_t> bytes;
+        int hits = 0;
+        std::vector<Address> where;
+    };
+    std::vector<Needle> needles;
+    auto add_u32 = [&](const char *name, uint32_t v) {
+        Needle n{ name, { static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 24) } };
+        needles.push_back(n);
+    };
+    add_u32("Dagan model 0x5DA08B21", 0x5DA08B21);
+    add_u32("DpToy model 0x3E6A7209", 0x3E6A7209);
+    add_u32("DpAbyss model 0x1151A229", 0x1151A229);
+    add_u32("DpAbyssChar model 0x1DECA51D", 0x1DECA51D);
+    for (const char *s : { "SoldierAnt", "NativeBeast", "BigBeastA", "WolfB", "DpToy" }) {
+        Needle n{ fmt::format("name \"{}\"", s) };
+        n.bytes.push_back(0);
+        n.bytes.insert(n.bytes.end(), s, s + std::strlen(s));
+        n.bytes.push_back(0);
+        needles.push_back(n);
+    }
+    std::vector<uint8_t> buffer;
+    uint64_t scanned = 0;
+    for (const auto &[start, size] : ranges) {
+        buffer.resize(size);
+        for (uint32_t off = 0; off < size; off += page)
+            if (!nova3k_safe_read(buffer.data() + off, Ptr<uint8_t>(start + off).get(mem), page))
+                std::memset(buffer.data() + off, 0, page);
+        scanned += size;
+        for (auto &n : needles) {
+            const auto *b = buffer.data();
+            const auto *e = b + buffer.size();
+            for (auto it = std::search(b, e, n.bytes.begin(), n.bytes.end()); it != e; it = std::search(it + 1, e, n.bytes.begin(), n.bytes.end())) {
+                n.hits++;
+                if (n.where.size() < 40)
+                    n.where.push_back(start + static_cast<uint32_t>(it - b));
+            }
+        }
+    }
+    LOG_INFO("Nova3K PSO2 memscan #{}: {} ranges, {} MiB in {} ms", scans, ranges.size(), scanned >> 20,
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+    auto dump = [&](const std::string &title, Address at, uint32_t before, uint32_t after) {
+        const Address from = at > before ? at - before : 0;
+        const uint32_t size = before + after;
+        if (!is_valid_addr_range(mem, from, from + size))
+            return;
+        std::vector<uint8_t> bytes(size);
+        if (!nova3k_safe_read(bytes.data(), Ptr<uint8_t>(from).get(mem), size))
+            return;
+        nova3k_hex_dump(title, bytes.data(), from, size);
+    };
+    for (const auto &n : needles) {
+        std::string list;
+        for (Address a : n.where)
+            list += fmt::format(" {:08X}", a);
+        LOG_INFO("Nova3K PSO2 memscan: {} - {} hits:{}", n.name, n.hits, list);
+        const bool is_name = n.name.starts_with("name");
+        for (size_t i = 0; i < n.where.size() && i < (is_name ? 4 : 6); i++)
+            dump(fmt::format("Nova3K PSO2 memscan: {} hit {}", n.name, i), n.where[i], is_name ? 64 : 128, is_name ? 192 : 128);
+    }
+    // pointers to the first name hits (tables of {name pointer, ...}): one pass over the memory
+    std::map<uint32_t, std::string> targets;
+    for (const auto &n : needles)
+        if (n.name.starts_with("name"))
+            for (size_t i = 0; i < n.where.size() && i < 3; i++)
+                targets[n.where[i] + 1] = n.name;
+    std::map<uint32_t, int> found;
+    std::vector<std::pair<Address, std::string>> pointer_hits;
+    for (const auto &[start, size] : ranges) {
+        if (targets.empty())
+            break;
+        buffer.resize(size);
+        for (uint32_t off = 0; off < size; off += page)
+            if (!nova3k_safe_read(buffer.data() + off, Ptr<uint8_t>(start + off).get(mem), page))
+                std::memset(buffer.data() + off, 0, page);
+        for (uint32_t off = 0; off + 4 <= size; off += 4) {
+            uint32_t v;
+            std::memcpy(&v, buffer.data() + off, 4);
+            const auto t = targets.find(v);
+            if (t != targets.end() && found[v]++ < 3)
+                pointer_hits.emplace_back(start + off, fmt::format("{} (string {:08X})", t->second, v));
+        }
+    }
+    for (const auto &[at, what] : pointer_hits)
+        dump("Nova3K PSO2 memscan: pointer to " + what, at, 96, 160);
+}
+} // namespace
+
 static void display_entry_thread(EmuEnvState &emuenv) {
     nova3k::perf::name_this_thread("gxm-display");
     auto &display_queue = emuenv.gxm.display_queue;
@@ -998,6 +1267,7 @@ struct SceGxmCommandList {
 static_assert(sizeof(SceGxmCommandList) - sizeof(std::stack<CommandListRange>) <= 32);
 
 struct SceGxmContext {
+    SceUID nova3k_last_thread = 0; // Nova3K: PSO2 diagnostics, last guest thread that recorded commands
     GxmContextState state;
 
     std::unique_ptr<renderer::Context> renderer;
@@ -1176,7 +1446,23 @@ struct SceGxmContext {
         renderer::Command *new_command = nullptr;
 
         if (state.type == SCE_GXM_CONTEXT_TYPE_IMMEDIATE) {
-            if (command_allocator_size > 0 && command_next_free_pos <= command_last_free_pos.load(std::memory_order_acquire)) {
+            // Nova3K: PSO2 never uses the command ring. The ring counts free slots, but takes the next
+            // slot round-robin: when a command is freed out of order (sceGxmFinish in the middle of a
+            // scene sends its command ahead of the scene), the ring wraps onto a slot that is still
+            // waiting to run. The overwritten command's link then leads into another frame, whose
+            // commands are run and freed twice (6.31 character creator crash; 1.000 drew too little
+            // per frame to wrap the ring). Host commands are allocated and freed one by one instead.
+            const bool nova3k_pso2 = nova3k::game::pso2_active().load(std::memory_order_relaxed);
+            if (nova3k_pso2) {
+                if (nova3k_last_thread != current_thread_id) {
+                    static std::atomic<int> thread_logs{ 0 };
+                    if (nova3k_last_thread != 0 && thread_logs.fetch_add(1, std::memory_order_relaxed) < 20)
+                        LOG_WARN("Nova3K PSO2 gxm: context {} records commands from thread {} (before: thread {})",
+                            fmt::ptr(this), current_thread_id, nova3k_last_thread);
+                    nova3k_last_thread = current_thread_id;
+                }
+            }
+            if (!nova3k_pso2 && command_allocator_size > 0 && command_next_free_pos <= command_last_free_pos.load(std::memory_order_acquire)) {
                 size_t offset = command_next_free_pos % command_allocator_size;
                 command_next_free_pos++;
                 new_command = alloc_space.cast<renderer::Command>().get(mem) + offset;
@@ -1184,6 +1470,11 @@ struct SceGxmContext {
             } else {
                 new_command = new renderer::Command;
                 new_command->flags |= renderer::Command::FLAG_FROM_HOST;
+                if (nova3k::game::pso2_active().load(std::memory_order_relaxed)) {
+                    auto &tracker = nova3k_host_commands();
+                    std::lock_guard<std::mutex> lock(tracker.mutex);
+                    tracker.live.insert(new_command);
+                }
             }
         } else {
             new_command = linearly_allocate<renderer::Command>(kern, mem, current_thread_id);
@@ -1198,6 +1489,16 @@ struct SceGxmContext {
     void free_new_command(renderer::Command *cmd) {
         if (!(cmd->flags & renderer::Command::FLAG_NO_FREE)) {
             if (cmd->flags & renderer::Command::FLAG_FROM_HOST) {
+                if (nova3k::game::pso2_active().load(std::memory_order_relaxed)) {
+                    auto &tracker = nova3k_host_commands();
+                    std::lock_guard<std::mutex> lock(tracker.mutex);
+                    if (tracker.live.erase(cmd) == 0) {
+                        if (tracker.logs.fetch_add(1, std::memory_order_relaxed) < 30)
+                            LOG_ERROR("Nova3K PSO2 gxm: renderer command {} (opcode {}) freed but not allocated on the host or already freed - skipped",
+                                fmt::ptr(cmd), static_cast<int>(cmd->opcode));
+                        return;
+                    }
+                }
                 delete cmd;
             } else {
                 command_last_free_pos.fetch_add(1, std::memory_order_release);
@@ -1255,6 +1556,12 @@ static int destroy_gxm_context(EmuEnvState &emuenv, SceGxmContext *context, cons
     if (!context) {
         return static_cast<int>(SCE_GXM_ERROR_INVALID_POINTER);
     }
+
+    static std::atomic<int> nova3k_destroy_logs{ 0 };
+    if (nova3k_gxm_log(nova3k_destroy_logs, 40))
+        LOG_INFO("Nova3K PSO2 gxm: destroy {} context {} (renderer context {}, pending commands {})",
+            context->state.type == SCE_GXM_CONTEXT_TYPE_IMMEDIATE ? "immediate" : "deferred", fmt::ptr(context),
+            fmt::ptr(context->renderer.get()), context->renderer ? nova3k_count_commands(context->renderer->command_list) : 0);
 
     if (context->state.type == SCE_GXM_CONTEXT_TYPE_IMMEDIATE) {
         const auto immediate_context = emuenv.gxm.immediate_contexts.find(context);
@@ -1692,6 +1999,11 @@ EXPORT(int, sceGxmBeginCommandList, SceGxmContext *deferredContext) {
 
 EXPORT(int, sceGxmBeginScene, SceGxmContext *context, uint32_t flags, const SceGxmRenderTarget *renderTarget, const SceGxmValidRegion *validRegion, SceGxmSyncObject *vertexSyncObject, Ptr<SceGxmSyncObject> fragmentSyncObject, const SceGxmColorSurface *colorSurface, const SceGxmDepthStencilSurface *depthStencil) {
     TRACY_FUNC(sceGxmBeginScene, context, flags, renderTarget, validRegion, vertexSyncObject, fragmentSyncObject, colorSurface, depthStencil);
+    if (nova3k_frame_on() && colorSurface)
+        nova3k_frame_note(fmt::format("  scene: color 0x{:X} {}x{} stride {} fmt 0x{:X} type {} downscale {} | depth {}",
+            colorSurface->data.address(), colorSurface->width, colorSurface->height, colorSurface->strideInPixels,
+            fmt::underlying(colorSurface->colorFormat), fmt::underlying(colorSurface->surfaceType), static_cast<int>(colorSurface->downscale),
+            nova3k_ds_desc(depthStencil)));
     if (!context) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
     }
@@ -1757,6 +2069,11 @@ EXPORT(int, sceGxmBeginScene, SceGxmContext *context, uint32_t flags, const SceG
 
 EXPORT(int, sceGxmBeginSceneEx, SceGxmContext *immediateContext, uint32_t flags, const SceGxmRenderTarget *renderTarget, const SceGxmValidRegion *validRegion, SceGxmSyncObject *vertexSyncObject, Ptr<SceGxmSyncObject> fragmentSyncObject, const SceGxmColorSurface *colorSurface, const SceGxmDepthStencilSurface *loadDepthStencilSurface, const SceGxmDepthStencilSurface *storeDepthStencilSurface) {
     TRACY_FUNC(sceGxmBeginSceneEx, immediateContext, flags, renderTarget, validRegion, vertexSyncObject, fragmentSyncObject, colorSurface, loadDepthStencilSurface, storeDepthStencilSurface);
+    if (nova3k_frame_on() && colorSurface)
+        nova3k_frame_note(fmt::format("  scene: color 0x{:X} {}x{} stride {} fmt 0x{:X} type {} downscale {} | depth {}",
+            colorSurface->data.address(), colorSurface->width, colorSurface->height, colorSurface->strideInPixels,
+            fmt::underlying(colorSurface->colorFormat), fmt::underlying(colorSurface->surfaceType), static_cast<int>(colorSurface->downscale),
+            nova3k_ds_desc(loadDepthStencilSurface)) + " | store depth " + nova3k_ds_desc(storeDepthStencilSurface));
     // storeDepthStencilSurface
     if (!immediateContext) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2031,6 +2348,9 @@ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmCo
     emuenv.gxm.immediate_contexts.emplace(ctx, context->address());
     if (emuenv.gxm.last_immediate_context == 0)
         emuenv.gxm.last_immediate_context = context->address();
+    static std::atomic<int> nova3k_create_logs{ 0 };
+    if (nova3k_gxm_log(nova3k_create_logs, 20))
+        LOG_INFO("Nova3K PSO2 gxm: create immediate context {} (renderer context {})", fmt::ptr(ctx), fmt::ptr(ctx->renderer.get()));
     return 0;
 }
 
@@ -2057,6 +2377,9 @@ EXPORT(int, sceGxmCreateDeferredContext, SceGxmDeferredContextParams *params, Pt
     // Create a generic context. This is only used for storing command list
     ctx->renderer = std::make_unique<renderer::Context>();
     emuenv.gxm.deferred_contexts.emplace(ctx, deferredContext->address());
+    static std::atomic<int> nova3k_create_logs{ 0 };
+    if (nova3k_gxm_log(nova3k_create_logs, 20))
+        LOG_INFO("Nova3K PSO2 gxm: create deferred context {}", fmt::ptr(ctx));
 
     return 0;
 }
@@ -2249,6 +2572,8 @@ EXPORT(int, sceGxmDestroyRenderTarget, Ptr<SceGxmRenderTarget> renderTarget) {
 
 EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<SceGxmSyncObject> newBuffer, Ptr<const void> callbackData) {
     TRACY_FUNC(sceGxmDisplayQueueAddEntry, oldBuffer, newBuffer, callbackData);
+    nova3k_frame_boundary();
+    nova3k_pso2_memscan(emuenv);
     if (!oldBuffer || !newBuffer)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
@@ -2389,9 +2714,13 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
             renderer::set_texture(*emuenv.renderer, context->renderer.get(), index_position, textures[index_position]);
         }
 
-        if (frag_textures_sync[texture_index])
+        if (frag_textures_sync[texture_index]) {
             renderer::set_texture(*emuenv.renderer, context->renderer.get(), texture_index, textures[texture_index]);
+            if (nova3k_frame_on())
+                nova3k_frame_texture(textures[texture_index]);
+        }
     }
+
 
     // Update vertex data. We should stores a copy of the data to pass it to GPU later, since another scene
     // may start to overwrite stuff when this scene is being processed in our queue (in case of OpenGL).
@@ -2454,7 +2783,11 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
 
 EXPORT(int, sceGxmDraw, SceGxmContext *context, SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, Ptr<const void> indexData, uint32_t indexCount) {
     TRACY_FUNC(sceGxmDraw, context, primType, indexType, indexData, indexCount);
-    return gxmDrawElementGeneral(emuenv, export_name, thread_id, context, primType, indexType, indexData, indexCount, 1);
+    const int result = gxmDrawElementGeneral(emuenv, export_name, thread_id, context, primType, indexType, indexData, indexCount, 1);
+    nova3k::game::gfx_count(result < 0 ? &nova3k::game::GfxCounters::draw_errors : &nova3k::game::GfxCounters::draws);
+    if (nova3k_frame_on())
+        nova3k_frame().scene_draws++;
+    return result;
 }
 
 EXPORT(int, sceGxmDrawInstanced, SceGxmContext *context, SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, Ptr<const void> indexData, uint32_t indexCount, uint32_t indexWrap) {
@@ -2463,11 +2796,18 @@ EXPORT(int, sceGxmDrawInstanced, SceGxmContext *context, SceGxmPrimitiveType pri
         LOG_WARN("Extra vertexes are requested to be drawn (ignored)");
     }
 
-    return gxmDrawElementGeneral(emuenv, export_name, thread_id, context, primType, indexType, indexData, indexWrap, indexCount / indexWrap);
+    const int result = gxmDrawElementGeneral(emuenv, export_name, thread_id, context, primType, indexType, indexData, indexWrap, indexCount / indexWrap);
+    nova3k::game::gfx_count(result < 0 ? &nova3k::game::GfxCounters::draw_errors : &nova3k::game::GfxCounters::draws);
+    if (nova3k_frame_on())
+        nova3k_frame().scene_draws++;
+    return result;
 }
 
 EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw *draw) {
     TRACY_FUNC(sceGxmDrawPrecomputed, context, draw);
+    nova3k::game::gfx_count(&nova3k::game::GfxCounters::precomputed);
+    if (nova3k_frame_on())
+        nova3k_frame().scene_draws++;
     if (!context) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
     }
@@ -2543,7 +2883,11 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
         }
 
         if (frag_textures_sync[texture_index])
+        {
             renderer::set_texture(*emuenv.renderer, context->renderer.get(), texture_index, frag_textures[texture_index]);
+            if (nova3k_frame_on())
+                nova3k_frame_texture(frag_textures[texture_index]);
+        }
     }
 
     size_t max_data_length[SCE_GXM_MAX_VERTEX_STREAMS] = {};
@@ -2612,6 +2956,10 @@ EXPORT(int, sceGxmEndCommandList, SceGxmContext *deferredContext, SceGxmCommandL
     deferredContext->curr_command_list->list = commandList->list;
 
     *commandList->list = deferredContext->renderer->command_list;
+    static std::atomic<int> nova3k_end_logs{ 0 };
+    if (nova3k_gxm_log(nova3k_end_logs, 20))
+        LOG_INFO("Nova3K PSO2 gxm: deferred context {} recorded command list {} ({} commands)", fmt::ptr(deferredContext),
+            fmt::ptr(commandList->list), nova3k_count_commands(*commandList->list));
 
     // insert last memory range
     deferredContext->insert_new_memory_range();
@@ -2628,6 +2976,8 @@ EXPORT(int, sceGxmEndCommandList, SceGxmContext *deferredContext, SceGxmCommandL
 
 EXPORT(int, sceGxmEndScene, SceGxmContext *context, SceGxmNotification *vertexNotification, SceGxmNotification *fragmentNotification) {
     TRACY_FUNC(sceGxmEndScene, context, vertexNotification, fragmentNotification);
+    if (nova3k_frame_on())
+        nova3k_frame_end_scene();
     const MemState &mem = emuenv.mem;
 
     if (!context) {
@@ -2685,9 +3035,46 @@ EXPORT(int, sceGxmExecuteCommandList, SceGxmContext *context, SceGxmCommandList 
     if (!commandList || !commandList->list)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
+    renderer::CommandList &imm_cmds = context->renderer->command_list;
+
+    // Nova3K: PSO2 copies the deferred commands instead of linking them (below). Linking chains the
+    // immediate list through the deferred list's last command; when the game executes the same
+    // command list again (every frame, or twice in a scene) before the render thread has run the
+    // previous one, the older chain jumps into the newer frame's commands, the render thread runs and
+    // frees them twice and crashes (character creator). A copy belongs to this scene only.
+    if (nova3k::game::pso2_active().load(std::memory_order_relaxed)) {
+        static std::atomic<int> nova3k_exec_logs{ 0 };
+        static std::atomic<uint64_t> nova3k_exec_count{ 0 };
+        const uint64_t exec_no = nova3k_exec_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const renderer::CommandList &src_list = *commandList->list;
+        size_t copied = 0;
+        for (const renderer::Command *src = src_list.first; src && copied < 1000000; src = (src == src_list.last) ? nullptr : src->next) {
+            renderer::Command *dst = context->renderer->alloc_func();
+            if (!dst)
+                break;
+            dst->opcode = src->opcode;
+            std::memcpy(dst->data, src->data, sizeof(dst->data));
+            dst->status = src->status;
+            dst->next = nullptr; // dst->flags stays as alloc_func set it (how the copy is freed)
+            if (imm_cmds.last) {
+                imm_cmds.last->next = dst;
+                imm_cmds.last = dst;
+            } else {
+                imm_cmds.first = dst;
+                imm_cmds.last = dst;
+            }
+            ++copied;
+        }
+        if (nova3k_exec_logs.fetch_add(1, std::memory_order_relaxed) < 40 || exec_no % 600 == 0)
+            LOG_INFO("Nova3K PSO2 gxm: execute command list {} into context {}: {} commands copied (execution #{})",
+                fmt::ptr(commandList->list), fmt::ptr(context), copied, exec_no);
+
+        gxmContextStateRestore(*emuenv.renderer, context, true);
+        return 0;
+    }
+
     // Emit a jump to the first command of given command list
     // Link the deferred commands into the immediate context currently recording this scene.
-    renderer::CommandList &imm_cmds = context->renderer->command_list;
 
     if (imm_cmds.last) {
         imm_cmds.last->next = commandList->list->first;
@@ -2719,6 +3106,12 @@ EXPORT(int, sceGxmFinish, SceGxmContext *context) {
     renderer::Context *renderer_context = context->renderer.get();
     if (!renderer_context)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+
+    // Nova3K: PSO2 diagnostics - sceGxmFinish inside a scene sends its command ahead of the scene's
+    static std::atomic<int> nova3k_finish_logs{ 0 };
+    if (context->state.active && nova3k_gxm_log(nova3k_finish_logs, 20))
+        LOG_INFO("Nova3K PSO2 gxm: sceGxmFinish inside a scene ({} commands of the scene not submitted yet)",
+            nova3k_count_commands(renderer_context->command_list));
 
     // Wait on this context's rendering finish code.
     renderer::finish(*emuenv.renderer, renderer_context);
@@ -2998,6 +3391,8 @@ EXPORT(int, sceGxmMidSceneFlush, SceGxmContext *immediateContext, uint32_t flags
         return RET_ERROR(SCE_GXM_ERROR_NOT_WITHIN_SCENE);
 
     SceGxmNotification notification = vertexNotification ? *vertexNotification : SceGxmNotification{ Ptr<uint32_t>(0), 0 };
+    if (nova3k_frame_on())
+        nova3k_frame_note(fmt::format("    mid-scene flush (notification {})", vertexNotification ? "yes" : "no"));
     renderer::add_command(immediateContext->renderer.get(), renderer::CommandOpcode::MidSceneFlush, nullptr, notification);
 
     if (vertexNotification) {
@@ -5501,6 +5896,10 @@ EXPORT(int, sceGxmTransferCopy, uint32_t width, uint32_t height, uint32_t colorK
     SceGxmTransferFormat srcFormat, SceGxmTransferType srcType, Ptr<void> srcAddress, uint32_t srcX, uint32_t srcY, int32_t srcStride,
     SceGxmTransferFormat destFormat, SceGxmTransferType destType, Ptr<void> destAddress, uint32_t destX, uint32_t destY, int32_t destStride,
     Ptr<SceGxmSyncObject> syncObject, SceGxmTransferFlags syncFlags, const SceGxmNotification *notification) {
+    if (nova3k_frame_on())
+        nova3k_frame_note(fmt::format("  transfer copy {}x{}: 0x{:X} fmt 0x{:X} type {} stride {} ({},{}) -> 0x{:X} fmt 0x{:X} type {} stride {} ({},{}) key mode {}",
+            width, height, srcAddress.address(), fmt::underlying(srcFormat), fmt::underlying(srcType), srcStride, srcX, srcY,
+            destAddress.address(), fmt::underlying(destFormat), fmt::underlying(destType), destStride, destX, destY, fmt::underlying(colorKeyMode)));
     TRACY_FUNC(sceGxmTransferCopy, width, height, colorKeyValue, colorKeyMask, colorKeyMode, srcFormat, srcType, srcAddress, srcX);
 #ifdef TRACY_ENABLE
     if (_tracy_activation_state) {
@@ -5578,6 +5977,9 @@ EXPORT(int, sceGxmTransferDownscale, SceGxmTransferFormat srcFormat, Ptr<void> s
     uint32_t srcX, uint32_t srcY, uint32_t srcWidth, uint32_t srcHeight, int32_t srcStride,
     SceGxmTransferFormat destFormat, Ptr<void> destAddress, uint32_t destX, uint32_t destY, int32_t destStride,
     Ptr<SceGxmSyncObject> syncObject, SceGxmTransferFlags syncFlags, const SceGxmNotification *notification) {
+    if (nova3k_frame_on())
+        nova3k_frame_note(fmt::format("  transfer downscale {}x{}: 0x{:X} fmt 0x{:X} stride {} -> 0x{:X} fmt 0x{:X} stride {}",
+            srcWidth, srcHeight, srcAddress.address(), fmt::underlying(srcFormat), srcStride, destAddress.address(), fmt::underlying(destFormat), destStride));
     TRACY_FUNC(sceGxmTransferDownscale, srcFormat, srcX, srcY, srcWidth, srcHeight, srcStride, destFormat, destAddress, destX);
 #ifdef TRACY_ENABLE
     if (_tracy_activation_state) {
@@ -5636,6 +6038,9 @@ EXPORT(int, sceGxmTransferDownscale, SceGxmTransferFormat srcFormat, Ptr<void> s
 EXPORT(int, sceGxmTransferFill, uint32_t fillColor, SceGxmTransferFormat destFormat, Ptr<void> destAddress,
     uint32_t destX, uint32_t destY, uint32_t destWidth, uint32_t destHeight, int32_t destStride,
     Ptr<SceGxmSyncObject> syncObject, SceGxmTransferFlags syncFlags, const SceGxmNotification *notification) {
+    if (nova3k_frame_on())
+        nova3k_frame_note(fmt::format("  transfer fill {}x{} color 0x{:08X}: 0x{:X} fmt 0x{:X} stride {}",
+            destWidth, destHeight, fillColor, destAddress.address(), fmt::underlying(destFormat), destStride));
     TRACY_FUNC(sceGxmTransferFill, fillColor, destFormat, destAddress, destX, destY, destWidth, destHeight, destStride, syncObject);
 #ifdef TRACY_ENABLE
     if (_tracy_activation_state) {

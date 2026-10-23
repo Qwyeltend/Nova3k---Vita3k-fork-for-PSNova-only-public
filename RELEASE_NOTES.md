@@ -1,12 +1,11 @@
-First public build of Nova3K, a Vita3K fork for **Phantasy Star Nova** on Android (arm64).
-Первая публичная сборка Nova3K — форка Vita3K для **Phantasy Star Nova** на Android (arm64).
+**Nova3K 0.2.0 — Phantasy Star Online 2 offline (demo)**
 
-- 55–60 FPS with **FPS Hack** on a Snapdragon 8 Gen 2 (lock-free JIT exclusive monitor), no audio stutter.
-  55–60 FPS с **FPS Hack** на Snapdragon 8 Gen 2 (монитор эксклюзивного доступа JIT без блокировки), без заикания звука.
-- No black screen before the SEGA logo / нет чёрного экрана перед логотипом SEGA.
-- Character editor texture fixes / исправлены текстуры в редакторе персонажа (rare glitches may remain / редкие глитчи ещё возможны).
+- **PSO2 for PS Vita (PCSG00141, update 6.31) runs offline** with a built-in server, [PhantasyServer](https://github.com/PhantasyServer/PhantasyServer) by Anton Maltsev (MIT). Login, ship, lobby, character creation, the quest counter and 15 generated "Exploration" quests (campship → field → field → the location's boss → exit, random field shapes, level-scaled enemies and rewards). Shops, story, Emergency quests and multiplayer do not work yet. See the README and `docs/pso2/INSTALL.md`.
+  **PSO2 для PS Vita (PCSG00141, обновление 6.31) работает без интернета** со встроенным сервером PhantasyServer (автор Anton Maltsev, MIT): вход, корабль, лобби, создание персонажа, стойка квестов и 15 сгенерированных квестов «Exploration». Магазины, сюжет, экстренные квесты и мультиплеер пока не работают. См. README и `docs/pso2/INSTALL.md`.
+- PSO2 rendering: 60 FPS (scene downscale on the GPU), white-screen, water and character-editor fixes. Character models need the Turnip driver on Adreno.
+  Рендер PSO2: 60 FPS, исправления белого экрана, воды и редактора персонажа. Для моделей персонажей нужен драйвер Turnip.
+- Phantasy Star Nova: the same settings as before; the PSO2 changes only act when PSO2 runs.
+  Phantasy Star Nova: настройки те же; изменения для PSO2 работают только при запуске PSO2.
 
-Required settings / нужные настройки: GPU **Vulkan**, V-Sync **ON**, Disable surface sync **OFF**, Async Pipeline Compilation **ON**, memory mapping **Double buffer**, FPS Hack **ON** (for 60 FPS), audio **SDL**.
-
-The game is not included. See the README for setup.
-Игра в комплект не входит. Настройка — в README.
+Installs over 0.1.0 (same package and signature). Games are not included.
+Ставится поверх 0.1.0 (тот же пакет и подпись). Игры в комплект не входят.

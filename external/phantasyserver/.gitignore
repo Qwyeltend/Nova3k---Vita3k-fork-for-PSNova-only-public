@@ -1,0 +1,14 @@
+/target
+/test
+/keypair.pem
+/ppac_reader/ppaks
+*.db
+*.db-*
+/master_ship.toml
+/ship.toml
+*.pac
+/logs/
+hostkeys.mp
+hostkeys.toml
+master_key.bin
+

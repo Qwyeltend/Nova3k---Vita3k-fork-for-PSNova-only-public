@@ -22,8 +22,14 @@
 #include <net/state.h>
 
 #include <util/lock_and_find.h>
+#include <util/nova3k_game.h>
 #include <util/net_utils.h>
 
+#include <fstream>
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <mutex>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -168,6 +174,17 @@ EXPORT(int, sceNetConnect, int sid, const SceNetSockaddr *addr, unsigned int add
     TRACY_FUNC(sceNetConnect, sid, addr, addrlen);
     auto sock = lock_and_find(sid, emuenv.net.socks, emuenv.kernel.mutex);
 
+    // Nova3K: PSO2 network log (only while that game runs with its patches on)
+    if (nova3k::game::pso2_net_log().load(std::memory_order_relaxed) && addr && addrlen >= sizeof(SceNetSockaddrIn)) {
+        const auto *in = reinterpret_cast<const SceNetSockaddrIn *>(addr);
+        uint32_t ip = 0;
+        memcpy(&ip, &in->sin_addr, sizeof(ip));
+        const int ret = sock ? sock->connect(addr, addrlen) : SCE_NET_ERROR_EBADF;
+        LOG_INFO("Nova3K PSO2 net: connect socket {} to {}.{}.{}.{}:{} -> {}", sid, ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, ip >> 24,
+            ((in->sin_port & 0xFF) << 8) | (in->sin_port >> 8), ret);
+        RET_NET_ERRNO(ret);
+    }
+
     RET_NET_ERRNO(sock ? sock->connect(addr, addrlen) : SCE_NET_ERROR_EBADF);
 }
 
@@ -201,6 +218,34 @@ EXPORT(int, sceNetEmulationSet) {
     return UNIMPLEMENTED();
 }
 
+// Nova3K PSO2: asynchronous DNS. PSO2 adds its resolver to an epoll, starts the lookup and waits for the
+// epoll to report the resolver as ready, then reads the result with sceNetResolverGetError. Vita3K resolves
+// synchronously and never reported the resolver in epoll, so the game gave up ("no answer from DNS", No.230).
+// Here the lookup result is kept and the next wait on that epoll reports the resolver once. PSO2 only.
+namespace {
+struct Pso2ResolverWatch {
+    int resolver_id = 0;
+    SceNetEpollEvent event{};
+    bool ready = false; // the lookup has finished and the event was not reported yet
+};
+std::mutex pso2_resolver_mutex;
+std::map<int, Pso2ResolverWatch> pso2_resolver_watches; // epoll id -> watch
+int pso2_resolver_error = 0;
+
+bool pso2_async_dns() {
+    return nova3k::game::pso2_active().load(std::memory_order_relaxed);
+}
+
+void pso2_resolver_finished(int rid, int error) {
+    const std::lock_guard<std::mutex> lock(pso2_resolver_mutex);
+    pso2_resolver_error = error;
+    for (auto &[eid, watch] : pso2_resolver_watches) {
+        if (watch.resolver_id == rid)
+            watch.ready = true;
+    }
+}
+} // namespace
+
 EXPORT(int, sceNetEpollAbort) {
     TRACY_FUNC(sceNetEpollAbort);
     return UNIMPLEMENTED();
@@ -213,6 +258,18 @@ EXPORT(int, sceNetEpollControl, int eid, SceNetEpollControlFlag op, int id, SceN
         RET_NET_ERRNO(SCE_NET_ERROR_EBADF);
 
     if (id == emuenv.net.resolver_id) {
+        if (pso2_async_dns()) {
+            const std::lock_guard<std::mutex> lock(pso2_resolver_mutex);
+            if (op == SCE_NET_EPOLL_CTL_DEL) {
+                pso2_resolver_watches.erase(eid);
+            } else if (ev) {
+                auto &watch = pso2_resolver_watches[eid];
+                watch.resolver_id = id;
+                watch.event = *ev;
+                watch.ready = false;
+            }
+            return 0;
+        }
         STUBBED("Async DNS resolve is not supported");
         return 0;
     }
@@ -244,12 +301,30 @@ EXPORT(int, sceNetEpollDestroy, int eid) {
     TRACY_FUNC(sceNetEpollDestroy, eid);
     const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
 
+    {
+        const std::lock_guard<std::mutex> resolver_lock(pso2_resolver_mutex);
+        pso2_resolver_watches.erase(eid);
+    }
     RET_NET_ERRNO(emuenv.net.epolls.erase(eid) ? 0 : SCE_NET_ERROR_EBADF);
 }
 
 EXPORT(int, sceNetEpollWait, int eid, SceNetEpollEvent *events, int maxevents, int timeout) {
     TRACY_FUNC(sceNetEpollWait, eid, events, maxevents, timeout);
     auto epoll = lock_and_find(eid, emuenv.net.epolls, emuenv.kernel.mutex);
+
+    if (epoll && pso2_async_dns() && events && maxevents > 0) {
+        const std::lock_guard<std::mutex> lock(pso2_resolver_mutex);
+        const auto it = pso2_resolver_watches.find(eid);
+        if (it != pso2_resolver_watches.end() && it->second.ready) {
+            it->second.ready = false;
+            events[0] = it->second.event;
+            // 0x10000: "resolver finished" (the game's loop at 0x81027810 waits for exactly this bit, then calls
+            // sceNetResolverGetError; bit 0x8 would mean an error)
+            events[0].events = 0x10000;
+            LOG_INFO("Nova3K PSO2 net: epoll {} reports resolver {} ready", eid, it->second.resolver_id);
+            return 1;
+        }
+    }
 
     RET_NET_ERRNO(epoll ? epoll->wait(events, maxevents, timeout) : SCE_NET_ERROR_EBADF);
 }
@@ -456,6 +531,9 @@ EXPORT(Ptr<const char>, sceNetInetNtop, int af, const void *src, Ptr<char> dst, 
 EXPORT(int, sceNetInetPton, int af, const char *src, void *dst) {
     TRACY_FUNC(sceNetInetPton, af, src, dst);
 
+    if (nova3k::game::pso2_net_log().load(std::memory_order_relaxed))
+        LOG_INFO("Nova3K PSO2 net: inet_pton(af {}, \"{}\")", af, src ? src : "");
+
     if (af != SCE_NET_AF_INET)
         RET_NET_ERRNO(SCE_NET_ERROR_EAFNOSUPPORT);
 
@@ -464,6 +542,11 @@ EXPORT(int, sceNetInetPton, int af, const char *src, void *dst) {
 #else
     int res = inet_pton(af, src, dst);
 #endif
+
+    // Nova3K PSO2: like the real system, a string that is not an IP address gives 0 (not an error); the game
+    // then looks the name up with the resolver. The error made PSO2 report "no answer from DNS" (No.230).
+    if (res == 0 && nova3k::game::pso2_active().load(std::memory_order_relaxed))
+        return 0;
 
     RET_NET_ERRNO(res == 0 ? SCE_NET_ERROR_EINVAL : PosixSocket::translate_return_value(res));
 }
@@ -539,6 +622,8 @@ EXPORT(int, sceNetResolverAbort) {
 
 EXPORT(int, sceNetResolverCreate, const char *name, void *param, int flags) {
     TRACY_FUNC(sceNetResolverCreate, name, param, flags);
+    if (nova3k::game::pso2_net_log().load(std::memory_order_relaxed))
+        LOG_INFO("Nova3K PSO2 net: resolver create \"{}\" -> id {}", name ? name : "", emuenv.net.resolver_id);
     STUBBED("Fake id");
     return emuenv.net.resolver_id;
 }
@@ -548,8 +633,13 @@ EXPORT(int, sceNetResolverDestroy, int rid) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNetResolverGetError) {
-    TRACY_FUNC(sceNetResolverGetError);
+EXPORT(int, sceNetResolverGetError, int rid, int *result) {
+    TRACY_FUNC(sceNetResolverGetError, rid, result);
+    if (pso2_async_dns() && result) {
+        const std::lock_guard<std::mutex> lock(pso2_resolver_mutex);
+        *result = pso2_resolver_error;
+        return 0;
+    }
     return UNIMPLEMENTED();
 }
 
@@ -560,14 +650,57 @@ EXPORT(int, sceNetResolverStartAton, int rid, const SceNetInAddr *addr, char *ho
     return 0;
 }
 
+// Nova3K PSO2: the game's servers (gsNNN.pso2gs.net) point to our own server instead of SEGA's.
+// Address: first line of <vita folder>/nova3k_pso2_server.txt (an IPv4 address), 127.0.0.1 if there is no file.
+static bool nova3k_pso2_redirect(EmuEnvState &emuenv, const char *hostname, SceNetInAddr *addr) {
+    if (!hostname || !nova3k::game::pso2_active().load(std::memory_order_relaxed))
+        return false;
+    const std::string host = hostname;
+    const std::string suffix = ".pso2gs.net";
+    if (host.size() < suffix.size() || host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0)
+        return false;
+
+    std::string target = "127.0.0.1";
+    std::ifstream file((emuenv.vita_fs_path / "nova3k_pso2_server.txt").string());
+    std::string line;
+    if (file && std::getline(file, line)) {
+        line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char c) { return std::isspace(c); }), line.end());
+        if (!line.empty())
+            target = line;
+    }
+    uint32_t ip = 0;
+    if (inet_pton(AF_INET, target.c_str(), &ip) != 1) {
+        LOG_WARN("Nova3K PSO2 net: \"{}\" in nova3k_pso2_server.txt is not an IPv4 address, using 127.0.0.1", target);
+        target = "127.0.0.1";
+        inet_pton(AF_INET, target.c_str(), &ip);
+    }
+    memcpy(addr, &ip, sizeof(ip));
+    LOG_INFO("Nova3K PSO2 net: resolve \"{}\" redirected to {}", host, target);
+    return true;
+}
+
 EXPORT(int, sceNetResolverStartNtoa, int rid, const char *hostname, SceNetInAddr *addr, int timeout, int retry, int flags) {
     TRACY_FUNC(sceNetResolverStartNtoa, rid, hostname, addr, timeout, retry, flags);
+    if (nova3k_pso2_redirect(emuenv, hostname, addr)) {
+        pso2_resolver_finished(rid, 0);
+        return 0;
+    }
     struct hostent *resolved = gethostbyname(hostname);
     if (resolved == nullptr) {
+        if (nova3k::game::pso2_net_log().load(std::memory_order_relaxed))
+            LOG_INFO("Nova3K PSO2 net: resolve \"{}\" failed", hostname ? hostname : "");
+        if (pso2_async_dns())
+            pso2_resolver_finished(rid, SCE_NET_ERROR_EHOSTUNREACH);
         memset(addr, 0, sizeof(*addr));
         RET_NET_ERRNO(SCE_NET_ERROR_EHOSTUNREACH);
     }
     memcpy(addr, resolved->h_addr, sizeof(uint32_t));
+    if (nova3k::game::pso2_net_log().load(std::memory_order_relaxed)) {
+        const auto *b = reinterpret_cast<const uint8_t *>(resolved->h_addr);
+        LOG_INFO("Nova3K PSO2 net: resolve \"{}\" -> {}.{}.{}.{}", hostname, b[0], b[1], b[2], b[3]);
+    }
+    if (pso2_async_dns())
+        pso2_resolver_finished(rid, 0);
     return 0;
 }
 

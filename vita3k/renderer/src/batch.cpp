@@ -16,6 +16,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <util/nova3k_perf.h>
+#include <util/nova3k_game.h>
 #include <renderer/commands.h>
 #include <renderer/driver_functions.h>
 #include <renderer/functions.h>
@@ -106,11 +107,23 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
         state.context = command_list.context;
 
     Command *cmd = command_list.first;
+    // Nova3K: PSO2 only, note the current command for the crash report
+    const bool trace = nova3k::game::pso2_active().load(std::memory_order_relaxed);
+    auto &rt = nova3k::game::render_trace();
 
     // Take a batch, and execute it. Hope it's not too large
     do {
         if (cmd == nullptr) {
             break;
+        }
+
+        if (trace) {
+            rt.commands = rt.commands + 1;
+            rt.opcode = static_cast<uint32_t>(cmd->opcode);
+            rt.flags = cmd->flags;
+            rt.command = reinterpret_cast<uintptr_t>(cmd);
+            rt.context = reinterpret_cast<uintptr_t>(command_list.context);
+            rt.stage = 1;
         }
 
         auto handler = handlers.find(cmd->opcode);
@@ -123,6 +136,8 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
 
         Command *last_cmd = cmd;
         cmd = cmd->next;
+        if (trace)
+            rt.stage = 2;
 
         if (command_list.context) {
             command_list.context->free_func(last_cmd);

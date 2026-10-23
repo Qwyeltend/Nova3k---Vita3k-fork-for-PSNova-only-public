@@ -21,6 +21,7 @@
 #include <mem/ptr.h>
 #include <renderer/gxm_types.h>
 #include <util/containers.h>
+#include <util/fs.h>
 #include <vkutil/objects.h>
 
 #include <optional>
@@ -97,6 +98,12 @@ struct ColorSurfaceCacheInfo : public SurfaceCacheInfo {
 
     // only used for 3-component rgb textures which can't be copied directly
     std::unique_ptr<vkutil::Buffer> copy_buffer;
+
+    // Nova3K (PSO2): the emulator wrote this surface's guest memory on the CPU (transfer copy / downscale /
+    // fill); the Vulkan image must be reloaded from memory before it is rendered to again
+    bool nova3k_reload_from_memory = false;
+    // Nova3K: the guest color format the surface was created with (PSO2 GPU downscale creates its target with it)
+    SceGxmColorFormat nova3k_color_format{};
 
     // pointer shared with the memory trap indicating if this surface sync is needed
     std::shared_ptr<bool> need_surface_sync;
@@ -189,6 +196,8 @@ private:
     void destroy_surface(ColorSurfaceCacheInfo &info);
     void destroy_surface(DepthStencilSurfaceCacheInfo &info);
 
+    void nova3k_reload_surface_from_memory(MemState &mem, ColorSurfaceCacheInfo &info);
+
 public:
     // when creating a mutable image, can we pass as an argument
     // the possible format used for an image view to improve performance ?
@@ -217,6 +226,17 @@ public:
     // if this call is used for a copy or similar operation set the changed address to the destination
     // so that subsequent calls to check_for_surface with the target destination also get delayed
     bool check_for_surface(MemState &mem, Address source_address, CallbackRequestFunction &callback, Address target_address);
+
+    // Nova3K (PSO2): a transfer done on the CPU wrote guest memory at address; mark the color surface there
+    void nova3k_cpu_wrote(Address address);
+
+    // Nova3K (PSO2): run sceGxmTransferDownscale on the GPU when its source is a cached color surface.
+    // Returns false if it cannot (the caller then uses the CPU path).
+    bool nova3k_gpu_downscale(MemState &mem, Address src_address, uint32_t src_width, uint32_t src_height, uint32_t src_stride_bytes,
+        Address dst_address, uint32_t dst_width, uint32_t dst_height, uint32_t dst_stride_bytes);
+
+    // Nova3K (PSO2 diagnostics): about every 1.5 s log the visibility query results (folder unused)
+    void nova3k_capture(MemState &mem, const fs::path &folder);
 
     // If non-null, the return value must be sent as a PostSurfaceSyncRequest
     ColorSurfaceCacheInfo *perform_surface_sync();

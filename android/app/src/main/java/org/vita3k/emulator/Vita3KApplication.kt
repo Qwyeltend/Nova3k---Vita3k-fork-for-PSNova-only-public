@@ -10,5 +10,6 @@ class Vita3KApplication : Application() {
         System.loadLibrary("Vita3K")
         SDLActivity.nativeSetenv("SDL_ANDROID_ALLOW_RECREATE_ACTIVITY", "1")
         UiLanguages.applyStored(this)
+        CrashLogcat.saveAfterCrash(this)
     }
 }

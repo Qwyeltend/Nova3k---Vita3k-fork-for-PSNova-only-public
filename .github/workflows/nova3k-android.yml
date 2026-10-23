@@ -1,17 +1,12 @@
 # Nova3K: builds the Android APK (arm64).
 # Runs only when started by hand (Actions -> Nova3K Android -> Run workflow),
 # so changes can pile up on main without spending a build on each push.
-# With a version number the APK is published as a GitHub release (v<version>);
-# without one it is only attached to the workflow run (test build).
+# The finished APK is attached to the workflow run as an artifact
+# and also published as the "latest" GitHub release for easy download.
 name: Nova3K Android
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version, e.g. 0.1.0 (leave empty for a test build without a release)'
-        required: false
-        default: ''
 
 concurrency:
   group: nova3k-android-${{ github.ref }}
@@ -70,38 +65,88 @@ jobs:
         with:
           key: nova3k-android
 
+      # PSO2 offline: PhantasyServer by Anton Maltsev (MIT), built into Nova3K as a static library.
+      # Only built when the vendored copy is present (pso2 branch). Failure here does not stop the APK:
+      # Nova3K then falls back to its own small built-in server.
+      - name: Set up Rust (PSO2 server)
+        if: hashFiles('external/phantasyserver/Cargo.toml') != ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust build (PSO2 server)
+        if: hashFiles('external/phantasyserver/Cargo.toml') != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: external/phantasyserver
+
+      - name: Build PSO2 server (PhantasyServer) for Android
+        if: hashFiles('external/phantasyserver/Cargo.toml') != ''
+        # Nova3K: on the pso2 branch an APK without the server is useless (endless "Authenticating"): stop
+        continue-on-error: ${{ github.ref_name != 'pso2' }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          set -eo pipefail
+          mkdir -p out
+          {
+            cargo install cargo-ndk --locked
+            cd external/phantasyserver
+            # compile the server data (maps, quests, enemies, items) on the build machine
+            cargo run --release -p data_compiler -- data
+            ls -l data/com_data.mp
+            export NOVA3K_COM_DATA="$PWD/data/com_data.mp"
+            cargo ndk -t arm64-v8a --platform 28 build --release -p nova3k_embed
+            ls -l target/aarch64-linux-android/release/libnova3k_embed.a
+            bash ../../tools/nova3k/pso2-server-lua.sh
+          } 2>&1 | tee out/pso2-server-build.log
+
       - name: Build APK
         env:
-          # Release key from the repository secrets, so updates install over the old app.
-          SIGNING_STORE_PATH: ${{ runner.temp }}/nova3k-release.jks
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          # Fixed personal signing key, so updates install over the old app.
+          SIGNING_STORE_PATH: ${{ github.workspace }}/android/nova3k.jks
+          SIGNING_STORE_PASSWORD: nova3kpass
           SIGNING_KEY_ALIAS: nova3k
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_STORE_BASE64: ${{ secrets.SIGNING_STORE_BASE64 }}
+          SIGNING_KEY_PASSWORD: nova3kpass
           VCPKG_ROOT: /usr/local/share/vcpkg
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
-          if [ -z "$SIGNING_STORE_BASE64" ]; then echo "Signing secrets are missing" >&2; exit 1; fi
-          echo "$SIGNING_STORE_BASE64" | base64 -d > "$SIGNING_STORE_PATH"
-          bash ./.ci/build-android.sh out
-          rm -f "$SIGNING_STORE_PATH"
-          name="Nova3K-${{ inputs.version }}"
-          [ -n "${{ inputs.version }}" ] || name="Nova3K-test-$(git rev-parse --short HEAD)"
-          mv out/app.apk "out/$name.apk"
+          set -o pipefail
+          mkdir -p logs
+          bash ./.ci/build-android.sh out 2>&1 | tee logs/apk-build.log
+          # main = stable Nova build; other branches (e.g. pso2) get their name in the file name
+          prefix="Nova3K"
+          [ "${{ github.ref_name }}" = "main" ] || prefix="Nova3K-${{ github.ref_name }}"
+          mv out/app.apk "out/${prefix}-$(git rev-parse --short HEAD).apk"
           ls -l out
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: Nova3K-android
-          path: out/*.apk
-
-      - name: Publish release
-        if: ${{ inputs.version != '' }}
+      - name: Publish build log on failure ("<branch>-build-log" release)
+        if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ inputs.version }}" out/*.apk \
-            --title "Nova3K ${{ inputs.version }}" \
-            --notes-file RELEASE_NOTES.md \
+          tag="${{ github.ref_name }}-build-log"
+          gh release delete "$tag" --yes --cleanup-tag || true
+          tail -c 3000000 logs/apk-build.log > logs/apk-build-tail.log || true
+          gh release create "$tag" logs/apk-build-tail.log $(ls out/*.log 2>/dev/null) --title "Build log ($(git rev-parse --short HEAD))" \
+            --notes "Failed build log" --target "${{ github.sha }}" --prerelease
+
+      - name: Collect native library with symbols (for profiling)
+        run: |
+          lib=$(find android/app/build -name libVita3K.so -path '*/obj/arm64-v8a/*' | head -n 1)
+          echo "unstripped library: $lib"
+          mkdir -p symbols && cp "$lib" symbols/ && ls -l symbols
+
+
+      - name: Publish release (main -> "latest", other branches -> "<branch>-latest")
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="latest"
+          [ "${{ github.ref_name }}" = "main" ] || tag="${{ github.ref_name }}-latest"
+          gh release delete "$tag" --yes --cleanup-tag || true
+          (cd symbols && zip -9 -q ../out/libVita3K-symbols.zip libVita3K.so)
+          gh release create "$tag" out/*.apk out/libVita3K-symbols.zip $(ls out/*.log 2>/dev/null) \
+            --title "Nova3K $tag build ($(git rev-parse --short HEAD))" \
+            --notes "Automatic build from commit ${{ github.sha }}: $(git log -1 --pretty=%s)" \
             --target "${{ github.sha }}"

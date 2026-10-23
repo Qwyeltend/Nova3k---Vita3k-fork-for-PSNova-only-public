@@ -1,0 +1,54 @@
+# Name of the server
+server_name = "phantasyserver"
+
+# Location of the SQLite database
+db_name = "ship.db"
+
+# Port of the block balancer
+balance_port = 12000
+
+# Minimum and maximum usable ship IDs.
+min_ship_id = 1
+max_ship_id = 10
+
+# Location of the RSA key file (if omitted key is generated in memory).
+key_file = "keypair.pem"
+
+# Address of the master ship (can be omitted if the ship can be discovered)
+master_ship = "localhost:15000"
+
+# PSK to authenticate with master ship
+master_ship_psk = "master_ship_psk"
+
+# Location of the compiled server data file (can be omitted if the master ship provides it)
+data_file = "data/com_data.mp"
+
+# Location of the logs directory
+log_dir = "logs"
+
+# Level of file logging. Possible levels: Error, Warn, Info, Debug, Trace
+file_log_level = "INFO"
+
+# Level of console logging
+console_log_level = "DEBUG"
+
+[[blocks]]
+
+# Optional port of the block
+#port = 13001
+
+# Name of the block
+name = "Block 1"
+
+# Max number of players
+max_players = 32
+
+# Name of the lobby map
+lobby_map = "lobby"
+
+[[blocks]]
+
+#port = 13002
+name = "Block 2"
+max_players = 32
+lobby_map = "lobby"

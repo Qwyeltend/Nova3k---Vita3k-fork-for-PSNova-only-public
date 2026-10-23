@@ -12,6 +12,11 @@ class EmulatorConfig {
     @JvmField var modulesMode: Int = 0
     @JvmField var lleModules: Array<String> = emptyArray()
     @JvmField var cpuOpt: Boolean = true
+    // Nova3K tweaks: 0 = auto (built-in game profile), 1 = on, 2 = off
+    @JvmField var nova3kLockFreeMonitor: Int = 0
+    @JvmField var nova3kFastJitInit: Int = 0
+    @JvmField var nova3kPerfMonitor: Int = 0
+    @JvmField var nova3kPso2Patches: Int = 0
 
     // GPU
     @JvmField var backendRenderer: String = "Vulkan"
@@ -101,6 +106,10 @@ class EmulatorConfig {
         config.modulesMode = modulesMode
         config.lleModules = lleModules.copyOf()
         config.cpuOpt = cpuOpt
+        config.nova3kLockFreeMonitor = nova3kLockFreeMonitor
+        config.nova3kFastJitInit = nova3kFastJitInit
+        config.nova3kPerfMonitor = nova3kPerfMonitor
+        config.nova3kPso2Patches = nova3kPso2Patches
         config.backendRenderer = backendRenderer
         config.highAccuracy = highAccuracy
         config.resolutionMultiplier = resolutionMultiplier
@@ -180,6 +189,10 @@ class EmulatorConfig {
         return modulesMode == other.modulesMode &&
             lleModules.contentEquals(other.lleModules) &&
             cpuOpt == other.cpuOpt &&
+            nova3kLockFreeMonitor == other.nova3kLockFreeMonitor &&
+            nova3kFastJitInit == other.nova3kFastJitInit &&
+            nova3kPerfMonitor == other.nova3kPerfMonitor &&
+            nova3kPso2Patches == other.nova3kPso2Patches &&
             backendRenderer == other.backendRenderer &&
             highAccuracy == other.highAccuracy &&
             resolutionMultiplier == other.resolutionMultiplier &&
@@ -256,6 +269,10 @@ class EmulatorConfig {
         var result = modulesMode
         result = 31 * result + lleModules.contentHashCode()
         result = 31 * result + cpuOpt.hashCode()
+        result = 31 * result + nova3kLockFreeMonitor
+        result = 31 * result + nova3kFastJitInit
+        result = 31 * result + nova3kPerfMonitor
+        result = 31 * result + nova3kPso2Patches
         result = 31 * result + backendRenderer.hashCode()
         result = 31 * result + highAccuracy.hashCode()
         result = 31 * result + resolutionMultiplier.hashCode()

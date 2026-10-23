@@ -169,10 +169,27 @@ if(ANDROID)
 		android/jni/input_overlay.cpp
 		android/jni/ime.cpp
 		interface.cpp
+		nova3k/pso2.cpp
+		nova3k/pso2_server.cpp
+		nova3k/pso2_crypto.cpp
 		performance.cpp
 	)
 	target_include_directories(vita3k PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 	target_link_libraries(vita3k PRIVATE SDL3::SDL3 pugixml::pugixml android)
+	# Nova3K: PSO2 offline server (PhantasyServer by Anton Maltsev, MIT), built by CI with cargo-ndk
+	set(NOVA3K_PSO2_SERVER_LIB "${CMAKE_SOURCE_DIR}/external/phantasyserver/target/aarch64-linux-android/release/libnova3k_embed.a")
+	if(EXISTS "${NOVA3K_PSO2_SERVER_LIB}")
+		message(STATUS "Nova3K: PSO2 server library found: ${NOVA3K_PSO2_SERVER_LIB}")
+		target_link_libraries(vita3k PRIVATE "${NOVA3K_PSO2_SERVER_LIB}" log dl m)
+		# Lua 5.1 for the server scripts, when mlua left it as a separate library (tools/nova3k/pso2-server-lua.sh)
+		set(NOVA3K_PSO2_LUA_LIB "${CMAKE_SOURCE_DIR}/external/phantasyserver/target/aarch64-linux-android/release/liblua_nova3k.a")
+		if(EXISTS "${NOVA3K_PSO2_LUA_LIB}")
+			target_link_libraries(vita3k PRIVATE "${NOVA3K_PSO2_LUA_LIB}")
+		endif()
+		target_compile_definitions(vita3k PRIVATE NOVA3K_PSO2_PHANTASY=1)
+	else()
+		message(STATUS "Nova3K: PSO2 server library not built, using the small built-in server")
+	endif()
 
 	if(CMAKE_BUILD_TYPE STREQUAL "Release")
 		# we need to exclude all symbols except SDL
@@ -203,7 +220,7 @@ if(ANDROID)
 		set_target_properties(vita3k PROPERTIES LINK_FLAGS "${LIBS_TO_EXCLUDE_FLAG}")
 	endif()
 else()
-	add_executable(vita3k MACOSX_BUNDLE main.cpp interface.cpp interface.h performance.cpp)
+	add_executable(vita3k MACOSX_BUNDLE main.cpp interface.cpp interface.h nova3k/pso2.cpp nova3k/pso2_server.cpp nova3k/pso2_crypto.cpp performance.cpp)
 endif()
 
 if(WIN32)

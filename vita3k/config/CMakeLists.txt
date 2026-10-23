@@ -8,6 +8,8 @@ add_library(
 	include/config/version.h
 	src/config.cpp
 	src/settings.cpp
+	include/config/nova3k_profiles.h
+	src/nova3k_profiles.cpp
 	version.cpp
 )
 

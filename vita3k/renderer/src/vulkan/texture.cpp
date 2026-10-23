@@ -26,6 +26,8 @@
 #include <renderer/functions.h>
 #include <util/align.h>
 #include <vkutil/vkutil.h>
+#include <util/log.h>
+#include <util/nova3k_game.h>
 
 namespace renderer::vulkan {
 
@@ -121,6 +123,16 @@ void sync_texture(VKContext &context, MemState &mem, std::size_t index, SceGxmTe
     if (!lookup_result.has_value() && is_depth_stencil_compatible_format(base_format, is_depth_surface)) {
         // Try to retrieve depth/stencil cache
         lookup_result = context.state.surface_cache.retrieve_depth_stencil_as_texture(texture, &texture_viewport);
+        if (is_depth_surface && nova3k::game::pso2_active().load(std::memory_order_relaxed)) {
+            nova3k::game::gfx_count(lookup_result.has_value() ? &nova3k::game::GfxCounters::depth_tex_gpu : &nova3k::game::GfxCounters::depth_tex_memory);
+            static int logged = 0;
+            if (logged < 10) {
+                logged++;
+                LOG_INFO("Nova3K PSO2 vulkan: depth texture 0x{:X} {}x{} fmt 0x{:X} type 0x{:X}: {}", texture.data_addr << 2,
+                    gxm::get_width(texture), gxm::get_height(texture), fmt::underlying(base_format), fmt::underlying(texture.texture_type()),
+                    lookup_result.has_value() ? "taken from the GPU depth buffer" : "NOT found on the GPU, read from guest memory");
+            }
+        }
     }
 
     if (lookup_result.has_value()) {

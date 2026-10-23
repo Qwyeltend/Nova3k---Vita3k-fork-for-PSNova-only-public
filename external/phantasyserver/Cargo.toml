@@ -1,0 +1,12 @@
+[workspace]
+
+members = ["ship_server", "data_compiler", "data_structs", "master_ship", "cmd-derive", "patch_server", "nova3k_embed"]
+exclude = ["ppac_reader"]
+resolver = "2"
+
+[workspace.dependencies]
+# pso2packetlib = { path = "../pso2packetlib", default-features = false }
+pso2packetlib = { version = "0.5.0", default-features = false }
+
+[profile.release]
+lto = true

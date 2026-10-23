@@ -18,6 +18,11 @@
 #include "vkutil/vkutil.h"
 
 #include "util/fs.h"
+#include "util/log.h"
+#include "util/nova3k_game.h"
+#include "util/nova3k_perf.h"
+
+#include <atomic>
 
 namespace vkutil {
 
@@ -134,6 +139,16 @@ static constexpr ImageLayoutTransition layout_transitions[] = {
 };
 
 static void transition_image_layout_impl(vk::CommandBuffer cmd_buffer, vk::Image image, ImageLayout src_layout, ImageLayout dst_layout, const vk::ImageSubresourceRange &range, bool initial_undefined) {
+    // Nova3K: PSO2 only - a barrier on a missing image (or without a command buffer) crashes the Adreno
+    // driver (vkCmdPipelineBarrier reading address 0x8, character creator). Skip it and say who asked.
+    if ((!image || !cmd_buffer) && nova3k::game::pso2_active().load(std::memory_order_relaxed)) {
+        static std::atomic<int> logs{ 0 };
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 30)
+            LOG_ERROR("Nova3K PSO2 vulkan: image layout barrier skipped ({}{}), {} -> {}, called from {}",
+                image ? "" : "no image", cmd_buffer ? "" : " no command buffer", static_cast<int>(src_layout), static_cast<int>(dst_layout),
+                nova3k::perf::describe_pc(reinterpret_cast<uintptr_t>(__builtin_return_address(0))));
+        return;
+    }
     const ImageLayoutTransition &src_transition = layout_transitions[static_cast<int>(src_layout)];
     const ImageLayoutTransition &dst_transition = layout_transitions[static_cast<int>(dst_layout)];
 

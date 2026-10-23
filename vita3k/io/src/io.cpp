@@ -40,6 +40,7 @@
 #include <iostream>
 #include <iterator>
 #include <string>
+#include <vector>
 
 #if defined(__aarch64__) && defined(__APPLE__)
 #define stat64 stat
@@ -786,7 +787,36 @@ bool copy_path(const fs::path &src_path, const fs::path &vita_fs_path, const std
     // Check if is path
     if (app_category.contains("gp")) {
         const auto app_path{ vita_fs_path / "ux0/app" / app_title_id };
-        const auto result = fs_utils::copy_directory_contents(src_path, app_path);
+        // Nova3K: move the patch files into the game folder instead of copying them.
+        // Both are on the same storage, so a move is instant and needs no extra space;
+        // copying a 17 GB patch needed 17 GB more free space. Falls back to copying.
+        size_t moved = 0, copied = 0;
+        bool result = true;
+        try {
+            // list first: files are moved out of the tree while we go
+            std::vector<fs::path> files;
+            for (const auto &src : fs::recursive_directory_iterator(src_path))
+                if (fs::is_regular_file(src))
+                    files.push_back(src.path());
+            for (const auto &file : files) {
+                const auto output_path = app_path / fs::relative(file, src_path);
+                fs::create_directories(output_path.parent_path());
+                boost::system::error_code ec;
+                fs::remove(output_path, ec);
+                ec.clear();
+                fs::rename(file, output_path, ec);
+                if (!ec) {
+                    moved++;
+                } else {
+                    fs::copy_file(file, output_path, fs::copy_options::overwrite_existing);
+                    copied++;
+                }
+            }
+        } catch (const std::exception &e) {
+            LOG_ERROR("Nova3K: merging the patch into {} failed: {}", app_path, e.what());
+            result = false;
+        }
+        LOG_INFO("Nova3K: patch merged into the game folder ({} files moved, {} copied)", moved, copied);
 
         fs::remove_all(src_path);
 

@@ -48,6 +48,7 @@ constexpr bool PAGE_NAME_TRACKING = true;
 
 // TODO: support multiple handlers
 static AccessViolationHandler access_violation_handler;
+static uint8_t *access_violation_memory_base = nullptr; // Nova3K: guest address 0 on the host, for crash reports
 static void register_access_violation_handler(const AccessViolationHandler &handler);
 
 static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_count, const char *name, const bool force);
@@ -115,6 +116,7 @@ bool init(MemState &state, const bool use_page_table) {
             nova3k::perf::on_page_fault(nova3k::perf::now_us() - start_us);
         return handled;
     };
+    access_violation_memory_base = state.memory.get();
     register_access_violation_handler(handler);
 
     const Address null_address = alloc_inner(state, 0, state.host_page_size / STANDARD_PAGE_SIZE, "null", true);
@@ -650,6 +652,29 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
     }
 
     LOG_CRITICAL("Unhandled access to 0x{:X}", reinterpret_cast<uintptr_t>(info->si_addr));
+#if defined(__linux__)
+    {
+        // Nova3K: say where the crash happened, then give the async logger time to write it out
+#ifdef __aarch64__
+        const uintptr_t host_pc = static_cast<uintptr_t>(context->uc_mcontext.pc);
+#else
+        const uintptr_t host_pc = static_cast<uintptr_t>(context->uc_mcontext.gregs[REG_RIP]);
+#endif
+        const auto resolver = nova3k::perf::guest_pc_resolver().load();
+        const uint32_t guest_block = resolver ? resolver(host_pc) : 0;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(access_violation_memory_base);
+        const uintptr_t fault = reinterpret_cast<uintptr_t>(info->si_addr);
+        LOG_CRITICAL("Nova3K crash: {} at host {} | guest code block {} | guest address {} | executing {}, writing {}",
+            sig == SIGBUS ? "SIGBUS" : "SIGSEGV", nova3k::perf::describe_pc(host_pc),
+            guest_block && guest_block < 0xE0000000 ? fmt::format("0x{:08X}", guest_block) : std::string("-"),
+            (base && fault >= base && fault - base < 0x100000000ull) ? fmt::format("0x{:08X}", fault - base) : std::string("-"),
+            is_executing, is_writing);
+        // the backtrace of this thread goes to nova3k_crash.txt (another thread may crash right after)
+        logging::write_crash_report(sig, info, uct);
+        spdlog::default_logger()->flush();
+        usleep(500000);
+    }
+#endif
     raise(SIGTRAP);
     return;
 }

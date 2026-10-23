@@ -15,6 +15,7 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <util/nova3k_game.h>
 #include <util/nova3k_perf.h>
 #include "io/functions.h"
 #include "io/io.h"
@@ -151,6 +152,38 @@ static void log_import_call(char emulation_level, uint32_t nid, SceUID thread_id
     }
 }
 
+// Nova3K PSO2: trace every network / PSN call of the game (name, first four arguments, result).
+// Only while PSO2 runs with its patches on. Each function is logged at most 300 times per thread, and
+// calls the game makes every frame (callbacks, epoll waits) are skipped so the log stays readable.
+// Returns true if it ran the call.
+static bool nova3k_pso2_trace(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread_id, const ImportFn &fn) {
+    struct Entry {
+        bool traced;
+        int count;
+        std::string name;
+    };
+    thread_local std::unordered_map<uint32_t, Entry> entries;
+    auto it = entries.find(nid);
+    if (it == entries.end()) {
+        std::string name = import_name(nid);
+        const auto starts = [&](const char *prefix) { return name.rfind(prefix, 0) == 0; };
+        const bool traced = (starts("sceNet") || starts("sceNp") || starts("sceHttp") || starts("sceSsl") || name.find("Network") != std::string::npos)
+            && !starts("sceNpTrophy") && name != "sceNpCheckCallback" && name != "sceNetCtlCheckCallback";
+        it = entries.emplace(nid, Entry{ traced, 0, std::move(name) }).first;
+    }
+    Entry &entry = it->second;
+    if (!entry.traced || entry.count >= 300)
+        return false;
+    ++entry.count;
+
+    const uint32_t a0 = read_reg(cpu, 0), a1 = read_reg(cpu, 1), a2 = read_reg(cpu, 2), a3 = read_reg(cpu, 3);
+    fn(emuenv, cpu, thread_id);
+    const uint32_t ret = read_reg(cpu, 0);
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    LOG_INFO("Nova3K PSO2 call [{}]: {}(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}) -> 0x{:X}", thread ? thread->name : std::string("?"), entry.name, a0, a1, a2, a3, ret);
+    return true;
+}
+
 void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread_id) {
     // HLE - call our C++ function
     if (emuenv.kernel.debugger.watch_import_calls) {
@@ -163,6 +196,8 @@ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread
         log_import_call('H', nid, thread_id, hle_nid_blacklist, lr);
     }
     const ImportFn *fn = resolve_import(nid);
+    if (fn && nova3k::game::pso2_net_log().load(std::memory_order_relaxed) && nova3k_pso2_trace(emuenv, cpu, nid, thread_id, *fn))
+        return;
     if (fn) {
         // Nova3K perf monitor: report guest calls that block for 1 ms or more, and account every
         // call of the game's main thread for the slow-frame breakdown
@@ -171,7 +206,7 @@ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread
             const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
             nova3k_is_main_thread = (thread && (thread->name == "PCSG00351" || thread->name == "PCSH00143")) ? 1 : 0;
         }
-        if constexpr (!nova3k::perf::monitor_enabled) {
+        if (!nova3k::perf::monitor_on()) {
             (*fn)(emuenv, cpu, thread_id);
             return;
         }

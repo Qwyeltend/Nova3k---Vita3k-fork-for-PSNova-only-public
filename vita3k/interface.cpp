@@ -20,7 +20,14 @@
 
 #include "module/load_module.h"
 
+#include <config/nova3k_profiles.h>
 #include <config/state.h>
+#include <cpu/functions.h>
+#include <util/nova3k_game.h>
+#include <util/nova3k_perf.h>
+
+#include "nova3k/pso2.h"
+#include "nova3k/pso2_server.h"
 #include <array>
 #include <cstring>
 #include <ctime>
@@ -40,6 +47,9 @@
 #include <renderer/texture_cache.h>
 
 #include <miniz.h>
+
+#include <fstream>
+#include <set>
 #include <pugixml.hpp>
 
 #include <modules/module_parent.h>
@@ -101,8 +111,15 @@ static bool is_nonpdrm(EmuEnvState &emuenv, const fs::path &output_path) {
         fs::path licpath = is_patch_found_app_license ? app_license_path : output_path / "sce_sys/package/work.bin";
         LOG_INFO("Decrypt layer: {}", output_path);
         if (!decrypt_install_nonpdrm(emuenv, licpath, output_path)) {
-            LOG_ERROR("NoNpDrm installation failed, deleting data!");
-            fs::remove_all(output_path);
+            const fs::path dec_path = fs_utils::path_concat(output_path, "_dec");
+            if (fs::exists(dec_path / ".nova3k_done")) {
+                // Nova3K: keep everything, the next install of the same archive resumes from here
+                LOG_ERROR("NoNpDrm installation failed; partial data kept, install the same archive again to resume");
+            } else {
+                LOG_ERROR("NoNpDrm installation failed, deleting data!");
+                fs::remove_all(output_path);
+                fs::remove_all(dec_path);
+            }
             return false;
         }
         return true;
@@ -193,8 +210,21 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
         return false;
     }
 
+    // Nova3K: resume an interrupted install. If a previous attempt already decrypted part of the
+    // content (<output>_dec/.nova3k_done exists), keep what is there and only extract what is missing.
+    const fs::path resume_list = fs_utils::path_concat(output_path, "_dec") / ".nova3k_done";
+    std::set<std::string> resume_done;
+    if (fs::exists(resume_list)) {
+        std::ifstream in(resume_list.string());
+        for (std::string line; std::getline(in, line);)
+            if (!line.empty())
+                resume_done.insert(line);
+        LOG_INFO("Nova3K: resuming the install of {}: {} files already decrypted", emuenv.app_info.app_title_id, resume_done.size());
+    }
+    const bool resuming = !resume_done.empty();
+
     const auto created = fs::create_directories(output_path);
-    if (!created) {
+    if (!created && !resuming) {
         if (reinstall_callback) {
             if (!reinstall_callback(emuenv.app_info.app_title, emuenv.app_info.app_title_id)) {
                 LOG_INFO("{} already installed, skipping", emuenv.app_info.app_title_id);
@@ -228,6 +258,13 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
             if (mz_zip_reader_is_file_a_directory(zip.get(), i)) {
                 fs::create_directories(file_output);
             } else {
+                if (resuming) {
+                    // already decrypted (its source may be shrunk) or already fully extracted: skip
+                    boost::system::error_code ec;
+                    const auto existing = fs::file_size(file_output, ec);
+                    if (resume_done.count(fs_utils::path_to_utf8(file_output)) || (!ec && existing == file_stat.m_uncomp_size))
+                        continue;
+                }
                 fs::create_directories(file_output.parent_path());
                 LOG_INFO("Extracting {}", file_output);
                 mz_zip_reader_extract_to_file(zip.get(), i, fs_utils::path_to_utf8(file_output).c_str(), 0);
@@ -471,6 +508,9 @@ static void apply_nova3k_patches(EmuEnvState &emuenv, const SceKernelModuleInfo 
     LOG_INFO("Nova3K: Phantasy Star Nova 60 FPS patch applied");
 }
 
+// Nova3K: PSO2 patches resolved for the game being booted (see the per-game switches in load_app_impl)
+static bool nova3k_pso2_active = false;
+
 static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const AppLaunchRequest &launch_request) {
     const auto call_import = [&emuenv](CPUState &cpu, uint32_t nid, SceUID thread_id) {
         ::call_import(emuenv, cpu, nid, thread_id);
@@ -478,6 +518,27 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
     emuenv.kernel.process_exit_callback = [&emuenv](int res, std::optional<AppLaunchRequest> relaunch) {
         emuenv.post_app_launch_request(relaunch.value_or(AppLaunchRequest{ .reason = AppLaunchReason::ProcessExit, .exit_code = res }));
     };
+    {
+        // Nova3K: per-game switches for our changes to the emulator core (Settings > CPU > Nova3K tweaks)
+        using config::nova3k::Tweak;
+        const auto &cc = emuenv.cfg.current_config;
+        const std::string &id = emuenv.io.title_id;
+        const bool lock_free = config::nova3k::tweak_enabled(cc, id, Tweak::LockFreeMonitor);
+        const bool fast_jit = config::nova3k::tweak_enabled(cc, id, Tweak::FastJitInit);
+        const bool perf = config::nova3k::tweak_enabled(cc, id, Tweak::PerfMonitor);
+        const bool pso2 = id == nova3k::pso2::title_id && config::nova3k::tweak_enabled(cc, id, Tweak::Pso2Patches);
+        nova3k_set_jit_tweaks(lock_free, fast_jit);
+        nova3k::perf::set_monitor_active(perf);
+        nova3k::game::pso2_net_log().store(pso2);
+        nova3k::game::pso2_active().store(pso2);
+        nova3k_pso2_active = pso2;
+        const auto *profile = config::nova3k::find_profile(id);
+        const bool own_file = fs::exists(emuenv.config_path / "config" / fmt::format("config_{}.xml", emuenv.io.app_path));
+        LOG_INFO("Nova3K: profile {}, settings from {}; lock-free monitor {}, fast JIT init {}, perf monitor {}{}",
+            profile ? profile->name : "none", own_file ? "the per-game file" : (profile ? "the built-in profile" : "global settings"),
+            lock_free ? "on" : "off", fast_jit ? "on" : "off", perf ? "on" : "off",
+            id == nova3k::pso2::title_id ? (pso2 ? ", PSO2 patches on" : ", PSO2 patches off") : "");
+    }
     if (!emuenv.kernel.init(emuenv.mem, call_import, emuenv.cfg.current_config.cpu_opt)) {
         LOG_WARN("Failed to init kernel!");
         return KernelInitFailed;
@@ -546,6 +607,10 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
         if (!patches.empty())
             do_patches(emuenv.mem, patches, module->info);
         apply_nova3k_patches(emuenv, module->info);
+        if (nova3k_pso2_active) {
+            nova3k::pso2::apply_patches(emuenv, module->info);
+            nova3k::pso2::server::start(fs_utils::path_to_utf8(emuenv.vita_fs_path));
+        }
     } else
         return FileNotFound;
     // Set self name from self path, can contain folder, get file name only

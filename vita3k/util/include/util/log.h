@@ -66,6 +66,9 @@ ExitCode init(const Root &root_paths, bool use_stdout);
 void set_level(spdlog::level::level_enum log_level);
 ExitCode add_sink(const fs::path &log_path);
 void set_log_callback(std::function<void(std::string, int)> cb);
+// Nova3K (Linux/Android): write a crash report (signal, backtrace, render command) to nova3k_crash.txt.
+// info is a siginfo_t *, uctx a ucontext_t *. Safe to call from a signal handler.
+void write_crash_report(int sig, void *info, void *uctx);
 
 } // namespace logging
 

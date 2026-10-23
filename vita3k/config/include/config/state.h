@@ -69,6 +69,11 @@ struct Config {
      */
     struct CurrentConfig {
         bool cpu_opt = true;
+        // Nova3K tweaks: 0 = auto (decided by the built-in game profile), 1 = on, 2 = off. See config/nova3k_profiles.h
+        int nova3k_lock_free_monitor = 0;
+        int nova3k_fast_jit_init = 0;
+        int nova3k_perf_monitor = 0;
+        int nova3k_pso2_patches = 0;
         int modules_mode = ModulesMode::AUTOMATIC;
         std::vector<std::string> lle_modules = {};
         std::string audio_backend = "SDL";

@@ -24,6 +24,7 @@
 #include <spdlog/fmt/bin_to_hex.h>
 
 #include <util/log.h>
+#include <util/nova3k_game.h>
 
 namespace renderer::vulkan {
 
@@ -88,8 +89,12 @@ void mid_scene_flush(VKContext &context, const SceGxmNotification notification) 
         .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
         .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
     };
-    context.render_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader, vk::PipelineStageFlagBits::eVertexInput,
-        vk::DependencyFlags(), barrier, {}, {});
+    // Nova3K: PSO2 only - no barrier without a command buffer (would crash the driver)
+    if (context.render_cmd || !nova3k::game::pso2_active().load(std::memory_order_relaxed))
+        context.render_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader, vk::PipelineStageFlagBits::eVertexInput,
+            vk::DependencyFlags(), barrier, {}, {});
+    else
+        LOG_ERROR_ONCE("Nova3K PSO2 vulkan: mid-scene flush barrier skipped, no render command buffer");
 
     if (restart_render_pass) {
         SceGxmNotification empty_notification = { Ptr<uint32_t>(0), 0 };
@@ -286,8 +291,10 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
         }
     }
 
-    if (max_stream_idx == 0)
+    if (max_stream_idx == 0) {
+        nova3k::game::gfx_count(&nova3k::game::GfxCounters::skipped_no_streams);
         return;
+    }
 
     for (int i = 0; i < max_stream_idx; i++) {
         if (state.vertex_streams[i].data) {
@@ -343,7 +350,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
 
     const SceGxmFragmentProgram &gxm_fragment_program = *context.record.fragment_program.get(mem);
     const SceGxmProgram &fragment_program_gxp = *gxm_fragment_program.program.get(mem);
-    if (context.state.features.direct_fragcolor && fragment_program_gxp.is_frag_color_used()) {
+    // Nova3K: PSO2 only - the programmable blending barrier needs a color image; without one the driver crashes
+    const bool nova3k_no_color_image = nova3k::game::pso2_active().load(std::memory_order_relaxed)
+        && (!context.current_color_base_image || !context.current_color_base_image->image || !context.render_cmd);
+    if (nova3k_no_color_image && context.state.features.direct_fragcolor && fragment_program_gxp.is_frag_color_used())
+        LOG_ERROR_ONCE("Nova3K PSO2 vulkan: framebuffer fetch barrier skipped, no color image");
+    if (nova3k_no_color_image && context.state.features.direct_fragcolor && fragment_program_gxp.is_frag_color_used()) {
+        // skipped (see above)
+    } else if (context.state.features.direct_fragcolor && fragment_program_gxp.is_frag_color_used()) {
         // the fragment shader is using programmable blending with a subpass input
         vk::ImageMemoryBarrier barrier{
             .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
@@ -385,6 +399,7 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
 
         const vk::QueryControlFlags control_flags = (context.is_query_op_increment && context.state.physical_device_features.occlusionQueryPrecise) ? vk::QueryControlFlagBits::ePrecise : vk::QueryControlFlags();
         context.render_cmd.beginQuery(context.current_visibility_buffer->query_pool, context.current_query_idx, control_flags);
+        nova3k::game::gfx_count(&nova3k::game::GfxCounters::vis_queries);
         context.is_in_query = true;
     }
 
@@ -407,8 +422,10 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     }
 
     // can happen with asynchronous pipeline compilation
-    if (context.current_pipeline == nullptr)
+    if (context.current_pipeline == nullptr) {
+        nova3k::game::gfx_count(&nova3k::game::GfxCounters::skipped_no_pipeline);
         return;
+    }
 
     if (config.log_active_shaders) {
         const std::string hash_text_f = hex_string(context.record.fragment_program.get(mem)->renderer_data->hash);

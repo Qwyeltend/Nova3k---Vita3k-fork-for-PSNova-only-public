@@ -30,6 +30,7 @@
 #include <renderer/vulkan/types.h>
 
 #include <renderer/functions.h>
+#include <util/nova3k_game.h>
 #include <util/tracy.h>
 
 namespace renderer {

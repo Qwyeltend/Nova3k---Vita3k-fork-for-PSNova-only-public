@@ -233,6 +233,17 @@ static std::string nova3k_jit_stats() {
 #endif
 }
 
+void nova3k_set_jit_tweaks(bool lock_free_monitor, bool fast_jit_init) {
+#if defined(__aarch64__)
+    Dynarmic::Nova3K::lock_free_exclusive_monitor.store(lock_free_monitor, std::memory_order_relaxed);
+    Dynarmic::Nova3K::invalidate_only_prelude.store(fast_jit_init, std::memory_order_relaxed);
+#else
+    // the x64 backend emits its own inline spinlock for exclusive accesses; keep it original
+    (void)lock_free_monitor;
+    (void)fast_jit_init;
+#endif
+}
+
 static const bool nova3k_hooks_registered = [] {
     nova3k::perf::guest_pc_resolver().store(&nova3k_guest_pc_for_host_pc);
     nova3k::perf::jit_stats_reporter().store(&nova3k_jit_stats);

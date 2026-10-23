@@ -15,6 +15,7 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <util/nova3k_game.h>
 #include <renderer/vulkan/surface_cache.h>
 
 #include <gxm/functions.h>
@@ -28,6 +29,7 @@
 #include <util/align.h>
 #include <util/log.h>
 #include <util/vector_utils.h>
+
 
 extern "C" {
 #include <libswscale/swscale.h>
@@ -112,6 +114,8 @@ static void protect_surface(MemState &mem, ColorSurfaceCacheInfo &info) {
             if (write && dirty) {
                 if (!*dirty && nova3k_log_once(surface_address, 1))
                     LOG_WARN("Nova3K: CPU wrote to color surface 0x{:X} (at 0x{:X}), GPU copy now treated as stale", surface_address, fault_address);
+                if (!*dirty)
+                    nova3k::game::gfx_count(&nova3k::game::GfxCounters::dirty_marks);
                 *dirty = true;
             }
             if (need_sync)
@@ -232,6 +236,240 @@ void VKSurfaceCache::cleanup() {
     last_written_surface = nullptr;
 }
 
+// Nova3K (PSO2): copy the guest memory of a color surface into its Vulkan image. Used after the
+// emulator itself wrote that memory on the CPU (sceGxmTransferDownscale/Copy/Fill run on the CPU):
+// without it the next scene rendered into the surface starts from the old GPU image and the
+// transfer result is lost. PSO2 6.31 downscales its 1408x768 scene into a 704x384 buffer every frame
+// and draws its glow on top; the glow piled up frame after frame on a never-refreshed image until
+// the buffer was white, and the final pass added it over the whole 3D scene (the UI stayed fine).
+void VKSurfaceCache::nova3k_reload_surface_from_memory(MemState &mem, ColorSurfaceCacheInfo &info) {
+    const bool supported = state.res_multiplier == 1.0f && info.tiling == SurfaceTiling::Linear
+        && gxm::bits_per_pixel(info.format) == 32 && info.swizzle.r == vk::ComponentSwizzle::eR
+        && info.texture.image && info.data;
+    if (!supported) {
+        if (nova3k_log_once(info.data.address(), 9))
+            LOG_WARN("Nova3K: surface 0x{:X} was written on the CPU but cannot be reloaded (format 0x{:X}, {}, scale {})",
+                info.data.address(), fmt::underlying(info.format), nova3k_tiling_name(info.tiling), state.res_multiplier);
+        return;
+    }
+
+    const uint32_t size = info.stride_bytes * info.original_height;
+    vkutil::Buffer staging(size);
+    staging.init_buffer(vk::BufferUsageFlagBits::eTransferSrc, vkutil::vma_mapped_alloc);
+    if (!staging.mapped_data) {
+        state.frame().destroy_queue.add_buffer(staging);
+        return;
+    }
+    memcpy(staging.mapped_data, info.data.cast<uint8_t>().get(mem), size);
+
+    VKContext *context = reinterpret_cast<VKContext *>(state.context);
+    vk::CommandBuffer cmd_buffer = context->prerender_cmd;
+    info.texture.transition_to(cmd_buffer, vkutil::ImageLayout::TransferDst);
+    vk::BufferImageCopy copy{
+        .bufferOffset = 0,
+        .bufferRowLength = info.stride_bytes / 4,
+        .bufferImageHeight = info.original_height,
+        .imageSubresource = vkutil::color_subresource_layer,
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { info.original_width, info.original_height, 1 }
+    };
+    cmd_buffer.copyBufferToImage(staging.buffer, info.texture.image, vk::ImageLayout::eTransferDstOptimal, copy);
+    info.texture.transition_to(cmd_buffer, vkutil::ImageLayout::ColorAttachmentReadWrite);
+    state.frame().destroy_queue.add_buffer(staging);
+
+    nova3k::game::gfx_count(&nova3k::game::GfxCounters::surface_reloads);
+    if (nova3k_log_once(info.data.address(), 10))
+        LOG_INFO("Nova3K: surface 0x{:X} ({}x{}) reloaded from guest memory after a CPU transfer", info.data.address(), info.original_width, info.original_height);
+}
+
+void VKSurfaceCache::nova3k_cpu_wrote(Address address) {
+    auto ite = color_address_lookup.upper_bound(address);
+    if (ite == color_address_lookup.begin())
+        return;
+    --ite;
+    ColorSurfaceCacheInfo &info = *ite->second;
+    if (ite->first + info.total_bytes <= address)
+        return;
+    info.nova3k_reload_from_memory = true;
+    // sampling it before the next render must read the memory too
+    if (info.dirty)
+        *info.dirty = true;
+}
+
+// Nova3K (PSO2 performance): PSO2 6.31 downscales its scene twice every frame with
+// sceGxmTransferDownscale (1408x768 -> 704x384 -> 352x192). The stock path copies the GPU image back
+// into guest memory, waits for it, scales it on the CPU and uploads the result again: about 600 ms of
+// waiting per second, the main reason the game stayed under 60 FPS. Here the scale is a GPU blit
+// (linear filter on an exact 2:1 ratio = the 2x2 average the Vita does) into a cached surface at the
+// destination address, so the next draws sampling it find it on the GPU. Guest memory of the
+// destination is not updated (the game only samples it with the GPU).
+bool VKSurfaceCache::nova3k_gpu_downscale(MemState &mem, Address src_address, uint32_t src_width, uint32_t src_height, uint32_t src_stride_bytes,
+    Address dst_address, uint32_t dst_width, uint32_t dst_height, uint32_t dst_stride_bytes) {
+    if (!state.features.enable_memory_mapping || state.disable_surface_sync)
+        return false;
+    if (src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 || dst_stride_bytes < dst_width * 4)
+        return false;
+
+    VKContext &context = *static_cast<VKContext *>(state.context);
+    // a scene is being recorded: a separate submission would run before it
+    if (context.is_recording || context.render_cmd)
+        return false;
+    // a CPU transfer is still pending on one of them: keep the ordering of the stock path
+    if (vector_utils::find_index(cpu_surfaces_changed, src_address) != -1 || vector_utils::find_index(cpu_surfaces_changed, dst_address) != -1)
+        return false;
+
+    // the surface containing an address (PSO2 downscales its scene in two halves: x = 0 and x = 704)
+    const auto find_containing = [&](Address address) -> std::pair<Address, ColorSurfaceCacheInfo *> {
+        auto ite = color_address_lookup.upper_bound(address);
+        if (ite == color_address_lookup.begin())
+            return { 0, nullptr };
+        --ite;
+        if (ite->first + ite->second->total_bytes <= address)
+            return { 0, nullptr };
+        return { ite->first, ite->second };
+    };
+
+    const auto [src_base, src] = find_containing(src_address);
+    if (!src)
+        return false;
+    if (src->last_frame_rendered + MAX_FRAMES_RENDERING <= context.frame_timestamp)
+        return false;
+    if (src->tiling != SurfaceTiling::Linear || gxm::bits_per_pixel(src->format) != 32 || !src->texture.image
+        || src->stride_bytes != src_stride_bytes || src->nova3k_reload_from_memory || *src->dirty)
+        return false;
+    const uint32_t src_offset = src_address - src_base;
+    const uint32_t sx = (src_offset % src_stride_bytes) / 4;
+    const uint32_t sy = src_offset / src_stride_bytes;
+    if ((src_offset % src_stride_bytes) % 4 != 0 || sx + src_width > src->original_width || sy + src_height > src->original_height)
+        return false;
+
+    vk::CommandBuffer cmd = nullptr;
+    bool done = false;
+    {
+        std::lock_guard<std::mutex> lock(state.multithread_pool_mutex);
+        cmd = vkutil::create_single_time_command(state.device, state.multithread_command_pool);
+    }
+
+    // the destination: inside an existing surface (second half), or a surface starting at it (found or created)
+    auto [dst_base, dst] = find_containing(dst_address);
+    if (!dst || dst_base == dst_address) {
+        SceGxmColorSurface dst_surface{};
+        // the whole stride: the other half of the picture goes into the same surface
+        dst_surface.width = std::max(dst_width, dst_stride_bytes / 4);
+        dst_surface.height = dst_height;
+        dst_surface.strideInPixels = dst_stride_bytes / 4;
+        dst_surface.data = Ptr<void>(dst_address);
+        dst_surface.colorFormat = src->nova3k_color_format;
+        dst_surface.surfaceType = SCE_GXM_COLOR_SURFACE_LINEAR;
+
+        // creating it records into prerender_cmd
+        ColorSurfaceCacheInfo *const prev_written = last_written_surface;
+        const bool prev_deferred = state.pipeline_cache.can_use_deferred_compilation;
+        context.prerender_cmd = cmd;
+        retrieve_color_surface_for_framebuffer(mem, &dst_surface);
+        context.prerender_cmd = nullptr;
+        last_written_surface = prev_written;
+        state.pipeline_cache.can_use_deferred_compilation = prev_deferred;
+
+        auto dst_it = color_address_lookup.find(dst_address);
+        dst = dst_it == color_address_lookup.end() ? nullptr : dst_it->second;
+        dst_base = dst_address;
+    }
+
+    const auto [src_base_after, src_after] = find_containing(src_address);
+    const uint32_t dst_offset = dst_address - dst_base;
+    const uint32_t dx = dst ? (dst_offset % dst_stride_bytes) / 4 : 0;
+    const uint32_t dy = dst_offset / dst_stride_bytes;
+    if (src_after == src && src_base_after == src_base && dst && dst != src && dst->texture.image && dst->texture.format == src->texture.format
+        && dst->stride_bytes == dst_stride_bytes && (dst_offset % dst_stride_bytes) % 4 == 0
+        && dx + dst_width <= dst->original_width && dy + dst_height <= dst->original_height) {
+        {
+            const vkutil::ImageLayout src_layout = src->texture.layout;
+            const vkutil::ImageLayout dst_layout = dst->texture.layout;
+            src->texture.transition_to(cmd, vkutil::ImageLayout::TransferSrc);
+            dst->texture.transition_to(cmd, vkutil::ImageLayout::TransferDst);
+
+            const float scale = state.res_multiplier;
+            const auto px = [scale](uint32_t v, int32_t limit) { return std::min<int32_t>(static_cast<int32_t>(v * scale), limit); };
+            vk::ImageBlit blit{
+                .srcSubresource = vkutil::color_subresource_layer,
+                .srcOffsets = std::array<vk::Offset3D, 2>{ vk::Offset3D{ px(sx, src->width), px(sy, src->height), 0 },
+                    vk::Offset3D{ px(sx + src_width, src->width), px(sy + src_height, src->height), 1 } },
+                .dstSubresource = vkutil::color_subresource_layer,
+                .dstOffsets = std::array<vk::Offset3D, 2>{ vk::Offset3D{ px(dx, dst->width), px(dy, dst->height), 0 },
+                    vk::Offset3D{ px(dx + dst_width, dst->width), px(dy + dst_height, dst->height), 1 } },
+            };
+            cmd.blitImage(src->texture.image, vk::ImageLayout::eTransferSrcOptimal, dst->texture.image, vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+
+            const auto back = [](vkutil::ImageLayout layout) {
+                return layout == vkutil::ImageLayout::Undefined || layout == vkutil::ImageLayout::TransferDst || layout == vkutil::ImageLayout::TransferSrc
+                    ? vkutil::ImageLayout::ColorAttachmentReadWrite
+                    : layout;
+            };
+            src->texture.transition_to(cmd, back(src_layout));
+            dst->texture.transition_to(cmd, back(dst_layout));
+
+            dst->nova3k_reload_from_memory = false;
+            *dst->dirty = false;
+            dst->last_frame_rendered = context.frame_timestamp;
+            done = true;
+        }
+    }
+
+    cmd.end();
+    vk::Fence fence = state.device.createFence({});
+    vk::SubmitInfo submit_info{};
+    submit_info.setCommandBuffers(cmd);
+    state.general_queue.submit(submit_info, fence);
+    CallbackRequestFunction cleanup = [&state = this->state, fence, cmd]() {
+        if (state.device.waitForFences(fence, vk::True, std::numeric_limits<uint64_t>::max()) != vk::Result::eSuccess)
+            LOG_ERROR("Could not wait for fences.");
+        state.device.destroyFence(fence);
+        std::lock_guard<std::mutex> lock(state.multithread_pool_mutex);
+        state.device.freeCommandBuffers(state.multithread_command_pool, cmd);
+    };
+    state.request_queue.push(CallbackRequest{ new CallbackRequestFunction(std::move(cleanup)) });
+
+    if (done) {
+        nova3k::game::gfx_count(&nova3k::game::GfxCounters::gpu_downscales);
+        if (nova3k_log_once(dst_address, 11))
+            LOG_INFO("Nova3K: transfer downscale 0x{:X} ({}x{}) -> 0x{:X} ({}x{}) done on the GPU", src_address, src_width, src_height, dst_address, dst_width, dst_height);
+    } else if (nova3k_log_once(dst_address, 12)) {
+        LOG_WARN("Nova3K: transfer downscale 0x{:X} -> 0x{:X} could not be done on the GPU, using the CPU path", src_address, dst_address);
+    }
+    return done;
+}
+
+
+// Nova3K (PSO2 diagnostics): about every 1.5 seconds while a 3D scene is shown, log the visibility
+// (occlusion query) results the game reads back. The white 3D layer comes from the final pass with
+// normal inputs, together with many more queries: a sun / light glare driven by them is the suspect.
+// Only guest memory is read: no GPU wait, no files.
+void VKSurfaceCache::nova3k_capture(MemState &mem, const fs::path &folder) {
+    static uint64_t frames = 0;
+    if (!color_address_lookup.contains(0x60A20000))
+        return;
+    if (++frames % 60 != 0)
+        return;
+
+    auto &g = nova3k::game::gfx_counters();
+    const uint32_t vis_address = g.vis_buffer_address.load(std::memory_order_relaxed);
+    const uint32_t vis_entries = std::min<uint32_t>(g.vis_buffer_entries.load(std::memory_order_relaxed), 256);
+    std::string values;
+    int shown = 0;
+    if (vis_address) {
+        const uint32_t *vis = Ptr<const uint32_t>(vis_address).get(mem);
+        for (uint32_t i = 0; vis && i < vis_entries && shown < 40; i++)
+            if (vis[i] != 0) {
+                values += fmt::format(" [{}]={}", i, vis[i]);
+                shown++;
+            }
+    }
+    LOG_INFO("Nova3K PSO2 visibility: buffer 0x{:X} ({} entries), queries counting {} / yes-no {} so far, non-zero results:{}",
+        vis_address, vis_entries, g.vis_queries_increment.load(std::memory_order_relaxed),
+        g.vis_queries_set.load(std::memory_order_relaxed), values.empty() ? " none" : values);
+}
+
 SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(MemState &mem, SceGxmColorSurface *color) {
     // Create the key to access the cache struct
     const uint32_t address = color->data.address();
@@ -306,8 +544,15 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
         } else {
             color_surface_queue.set_as_mru(&info);
 
-            if (info.data && *info.dirty)
+            if (info.nova3k_reload_from_memory) {
+                info.nova3k_reload_from_memory = false;
+                nova3k_reload_surface_from_memory(mem, info);
+            }
+
+            if (info.data && *info.dirty) {
                 protect_surface(mem, info);
+                nova3k::game::gfx_count(&nova3k::game::GfxCounters::dirty_clears);
+            }
             *info.dirty = false;
 
             last_written_surface = &info;
@@ -361,6 +606,7 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
     info_added.original_height = original_height;
     info_added.stride_bytes = bytes_per_stride;
     info_added.data = color->data;
+    info_added.nova3k_color_format = color->colorFormat;
     info_added.total_bytes = total_surface_size;
     info_added.format = base_format;
     info_added.tiling = tiling;
@@ -446,6 +692,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
         return std::nullopt;
 
     if (*ite->second->dirty) {
+        nova3k::game::gfx_count(&nova3k::game::GfxCounters::dirty_reads);
         // Guest wrote to the surface backing memory since it was rendered, so GPU data is stale.
         if (nova3k_log_once(address, 3))
             LOG_WARN("Nova3K: texture 0x{:X} ({}x{}) not taken from surface 0x{:X}: surface marked dirty by CPU write, reading guest memory instead",
@@ -515,6 +762,15 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
     }
 
     // Check if we can use this surface
+    // Nova3K (PSO2 only): a texture cut from the right part of a wider surface (a tile of an atlas) ends at
+    // stride * (height - 1) + its own row width, not at a whole extra stride. PSO2 6.31 keeps its exposure
+    // values in the bottom-right 256x128 tile of a 512x256 surface; counting a full last row put that tile
+    // 1 KB past the surface end, so it was read from stale guest memory instead and the scene went white.
+    if (nova3k::game::pso2_active() && tiling == SurfaceTiling::Linear && original_height > 0) {
+        const uint32_t row_bytes = original_width * gxm::bits_per_pixel(base_format) / 8;
+        if (row_bytes <= stride_bytes)
+            total_surface_size = stride_bytes * (original_height - 1) + row_bytes;
+    }
     bool addr_in_range_of_cache = ((address + total_surface_size) <= (ite->first + info.total_bytes + 4));
 
     if (ite->first != address && !addr_in_range_of_cache) {
@@ -944,12 +1200,24 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_depth_stencil_as_tex
         }
     }
 
-    if (found_info == nullptr)
+    if (found_info == nullptr) {
+        if (nova3k::game::pso2_active().load(std::memory_order_relaxed) && nova3k_log_once(address, 11)) {
+            std::string known;
+            for (const auto &[addr, info] : depth_address_lookup)
+                known += fmt::format(" 0x{:X}({} bytes)", addr, info->total_bytes);
+            LOG_WARN("Nova3K PSO2: depth texture 0x{:X} ({} bytes) is not a depth buffer the emulator keeps; known depth buffers:{}",
+                address, total_bytes, known.empty() ? " none" : known);
+        }
         return std::nullopt;
+    }
 
     DepthStencilSurfaceCacheInfo &cached_info = *found_info;
-    if (tiling != cached_info.tiling || stride_samples != cached_info.stride_samples)
+    if (tiling != cached_info.tiling || stride_samples != cached_info.stride_samples) {
+        if (nova3k::game::pso2_active().load(std::memory_order_relaxed) && nova3k_log_once(address, 12))
+            LOG_WARN("Nova3K PSO2: depth texture 0x{:X} not taken from depth buffer 0x{:X}: tiling {} vs {}, stride {} vs {} samples",
+                address, surface_address, nova3k_tiling_name(tiling), nova3k_tiling_name(cached_info.tiling), stride_samples, cached_info.stride_samples);
         return std::nullopt;
+    }
 
     // we sample from it, set the surface as most recently used
     ds_surface_queue.set_as_mru(found_info);

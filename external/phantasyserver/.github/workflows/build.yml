@@ -1,0 +1,98 @@
+name: Test and build
+on: push
+env: 
+  RUSTFLAGS: "-Dwarnings"
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Pull repo
+      uses: actions/checkout@v6
+    - name: Check
+      if: ${{ success() }}
+      run: cargo check --all-targets --all-features
+    - name: Run clippy
+      if: ${{ success() }}
+      run: cargo clippy --all-targets --all-features
+    - name: Run tests
+      if: ${{ success() }}
+      run: cargo test --all-features
+  build-data:
+    runs-on: ubuntu-22.04
+    needs: test
+    if: github.ref == 'refs/heads/master'
+    steps:
+    - name: Pull repo
+      uses: actions/checkout@v6
+    - name: Compile data
+      if: ${{ success() }}
+      run: cargo run --bin=data_compiler data 
+    - name: Move build artifacts
+      if: ${{ success() }}
+      run: |
+        mkdir -p data_compiled
+        mv data/com_data.mp data_compiled
+        mv data/ship.toml data_compiled
+        mv data/master_ship.toml data_compiled
+        mv data/friend.json data_compiled
+    - name: Upload data artifact
+      if: ${{ success() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: data
+        path: ./data_compiled/*
+
+  build:
+    runs-on: ${{ matrix.os }}
+    needs: test
+    if: github.ref == 'refs/heads/master'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-latest
+          TARGET: aarch64-unknown-linux-gnu
+          CROSS_FLAGS: '--git https://github.com/cross-rs/cross'
+        - os: ubuntu-latest
+          TARGET: armv7-unknown-linux-gnueabihf
+          CROSS_FLAGS: '--git https://github.com/cross-rs/cross'
+        - os: ubuntu-latest
+          TARGET: x86_64-unknown-linux-gnu
+          CROSS_FLAGS: '--git https://github.com/cross-rs/cross'
+        - os: ubuntu-latest
+          TARGET: x86_64-pc-windows-gnu
+          EXTENSION: .exe
+          CROSS_FLAGS: '--git https://github.com/cross-rs/cross'
+        - os: windows-latest
+          TARGET: x86_64-pc-windows-msvc
+          EXTENSION: .exe
+    steps:
+    - name: Pull repo
+      uses: actions/checkout@v6
+    - name: Install rustup
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain stable --profile default --target ${{ matrix.TARGET }} -y
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: Install cross
+      if: ${{ success() }}
+      env:
+        RUSTFLAGS: ""
+      run: |
+        cargo install cross ${{ matrix.CROSS_FLAGS }}
+    - name: Build
+      if: ${{ success() }}
+      run: cross build --release --target=${{ matrix.TARGET }}
+    - name: Move build artifacts
+      if: ${{ success() }}
+      run: |
+        mkdir output
+        mv target/${{ matrix.TARGET }}/release/pso2ship_server${{ matrix.EXTENSION }} output
+        mv target/${{ matrix.TARGET }}/release/master_ship${{ matrix.EXTENSION }} output
+        mv target/${{ matrix.TARGET }}/release/data_compiler${{ matrix.EXTENSION }} output
+        mv target/${{ matrix.TARGET }}/release/patch_server${{ matrix.EXTENSION }} output
+    - name: Upload bin artifact
+      if: ${{ success() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ matrix.TARGET }}-pso2server
+        path: ./output/*

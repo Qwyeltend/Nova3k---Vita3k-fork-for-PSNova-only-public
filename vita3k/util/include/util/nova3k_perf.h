@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <util/nova3k_game.h>
+
 // Nova3K performance monitor.
 //
 // Once per second it writes one "Nova3K perf" line to the log with:
@@ -70,6 +72,18 @@
 namespace nova3k::perf {
 
 constexpr bool monitor_enabled = NOVA3K_PERF_MONITOR != 0;
+
+// Nova3K: switched per game when it boots (Settings > CPU > Nova3K tweaks > Performance monitor)
+inline std::atomic<bool> &monitor_active_flag() {
+    static std::atomic<bool> active{ false };
+    return active;
+}
+inline void set_monitor_active(bool active) {
+    monitor_active_flag().store(active, std::memory_order_relaxed);
+}
+inline bool monitor_on() {
+    return monitor_enabled && monitor_active_flag().load(std::memory_order_relaxed);
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -583,6 +597,21 @@ inline void report_window(const std::vector<int64_t> &frame_times_us, const std:
         vblanks, late_vblanks, worst_vblank_gap_us / 1000.0, underruns, transfers, transfer_wait_us / 1000.0,
         page_faults, page_fault_us / 1000.0);
 
+    // ---- Nova3K PSO2 graphics counters ----
+    if (nova3k::game::pso2_active().load(std::memory_order_relaxed)) {
+        auto &g = nova3k::game::gfx_counters();
+        auto take = [](std::atomic<uint64_t> &v) { return v.exchange(0, std::memory_order_relaxed); };
+        const uint64_t draws = take(g.draws), draw_errors = take(g.draw_errors), precomputed = take(g.precomputed);
+        const uint64_t no_streams = take(g.skipped_no_streams), no_pipeline = take(g.skipped_no_pipeline);
+        const uint64_t vis_queries = take(g.vis_queries);
+        const uint64_t dirty_marks = take(g.dirty_marks), dirty_reads = take(g.dirty_reads), dirty_clears = take(g.dirty_clears);
+        const uint64_t surface_reloads = take(g.surface_reloads), gpu_downscales = take(g.gpu_downscales);
+        LOG_INFO("Nova3K PSO2 gfx: draws {} (rejected {}), precomputed draws {} | renderer skipped: no vertex streams {}, no pipeline {} | "
+                 "visibility queries {} | stale surfaces: CPU writes {}, textures read from memory {}, re-rendered {} | surfaces reloaded after CPU transfers {} | "
+                 "downscales on the GPU {}",
+            draws, draw_errors, precomputed, no_streams, no_pipeline, vis_queries, dirty_marks, dirty_reads, dirty_clears, surface_reloads, gpu_downscales);
+    }
+
     // ---- where guest threads blocked inside emulator calls ----
     {
         std::vector<std::pair<SlowCall, std::string>> calls;
@@ -690,7 +719,7 @@ inline void post_report(std::vector<int64_t> frame_times_us, const uint64_t (&hi
 
 // Called on every game frame flip (sceDisplaySetFrameBuf with NEXTFRAME).
 inline void on_game_frame(uint64_t vblank_count) {
-    if constexpr (!monitor_enabled)
+    if (!monitor_on())
         return;
     static std::mutex mutex;
     static int64_t window_start_us = 0;
